@@ -1453,6 +1453,7 @@ def _repair_json(json_str: str) -> str:
     """Attempt to repair common JSON errors.
 
     Repairs:
+    - Markdown code fences (```json ... ```)
     - Trailing commas before ] or }
     - Single quotes to double quotes (for keys/values)
     - Unescaped newlines in strings
@@ -1467,6 +1468,11 @@ def _repair_json(json_str: str) -> str:
     import re
 
     s = json_str.strip()
+
+    # 0. Strip markdown code fences (Claude sometimes wraps JSON in ```json...```)
+    s = re.sub(r'^```(?:json)?\s*', '', s)
+    s = re.sub(r'\s*```$', '', s)
+    s = s.strip()
 
     # 1. Remove trailing commas before ] or }
     s = re.sub(r',(\s*[}\]])', r'\1', s)
