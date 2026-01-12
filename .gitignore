@@ -1,0 +1,171 @@
+# =============================================================================
+# Claude on Rails Review - Runtime State Files
+# =============================================================================
+# These are created during hook execution and should never be committed
+stop-hook-state-*.json
+review-results-*.json
+stop-hook-debug.log
+stop-hook-metrics.jsonl
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+*.manifest
+*.spec
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# =============================================================================
+# IDE and Editors
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+.spyderproject
+.spyproject
+.ropeproject
+
+# JetBrains
+.idea/
+*.iml
+*.iws
+out/
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+tags
+[._]*.un~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# =============================================================================
+# OS Generated Files
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# =============================================================================
+# Testing
+# =============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# =============================================================================
+# Environment and Secrets
+# =============================================================================
+# NEVER commit these files - they may contain API keys
+.env
+.env.local
+.env.*.local
+*.env
+secrets.json
+credentials.json
+.anthropic
+.openai
+
+# =============================================================================
+# Logs and Debug
+# =============================================================================
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =============================================================================
+# Package managers
+# =============================================================================
+node_modules/
+package-lock.json
+yarn.lock
+.npm
+.yarn-integrity
+
+# =============================================================================
+# Temporary and Cache Files
+# =============================================================================
+*.tmp
+*.temp
+*.bak
+*.backup
+.cache/
+tmp/
+temp/
+
+# =============================================================================
+# Documentation build
+# =============================================================================
+docs/_build/
+site/
+
+# =============================================================================
+# Claude Code specific (when using this repo AS a project)
+# =============================================================================
+# Uncomment these if using Claude on Rails Review in another project
+# .claude/hooks/stop-hook-state-*.json
+# .claude/hooks/review-results-*.json
+# .claude/hooks/stop-hook-debug.log
+# .claude/hooks/stop-hook-metrics.jsonl

@@ -1,0 +1,24 @@
+{
+  "module_boundaries": {
+    "api": {
+      "allowed_imports": ["core", "shared"],
+      "forbidden_imports": ["services", "internal"],
+      "communication": "Must use gRPC to communicate with services"
+    },
+    "services": {
+      "allowed_imports": ["core", "shared"],
+      "forbidden_imports": ["api", "frontend"],
+      "communication": "Use gRPC for inter-service communication"
+    },
+    "frontend": {
+      "allowed_imports": ["shared"],
+      "forbidden_imports": ["api", "services", "core"],
+      "communication": "Must use REST API or WebSocket only"
+    },
+    "core": {
+      "allowed_imports": [],
+      "forbidden_imports": ["api", "services", "frontend"],
+      "communication": "Core is a shared library - no dependencies on other modules"
+    }
+  }
+}
