@@ -66,9 +66,9 @@ The hook runs automatically when Claude tries to stop. It will:
 
 - **explore_haiku** - Fast scan for obvious issues, hardcoded values
 - **general_haiku** - Silent failures, missing validation, security
-- **bug_hunter** - Race conditions, resource leaks, edge cases (Sonnet)
-- **general_sonnet** - Architecture, service boundaries (Sonnet)
-- **integration_checker** - Cross-module consistency (added dynamically)
+- **bug_hunter** - Race conditions, resource leaks, edge cases (Default: Sonnet)
+- **general_sonnet** - Architecture, service boundaries (Default: Sonnet)
+- **integration_checker** - Cross-module consistency (added dynamically, Default: Opus)
 
 ### Auto-Continue Logic
 
