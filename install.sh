@@ -89,12 +89,12 @@ fi
 echo ""
 echo "Adding hook state files to .gitignore..."
 if [ -f ".gitignore" ]; then
-    if ! grep -q "stop-hook-state.json" .gitignore; then
+    if ! grep -q "stop-hook-state" .gitignore; then
         cat >> .gitignore << 'EOF'
 
 # Claude on Rails Review state files
-.claude/hooks/stop-hook-state.json
-.claude/hooks/review-results*.json
+.claude/hooks/stop-hook-state-*.json
+.claude/hooks/review-results-*.json
 .claude/hooks/stop-hook-debug.log
 .claude/hooks/stop-hook-metrics.jsonl
 EOF
@@ -106,8 +106,8 @@ else
     echo -e "${YELLOW}No .gitignore found, creating one...${NC}"
     cat > .gitignore << 'EOF'
 # Claude on Rails Review state files
-.claude/hooks/stop-hook-state.json
-.claude/hooks/review-results*.json
+.claude/hooks/stop-hook-state-*.json
+.claude/hooks/review-results-*.json
 .claude/hooks/stop-hook-debug.log
 .claude/hooks/stop-hook-metrics.jsonl
 EOF

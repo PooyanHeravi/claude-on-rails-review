@@ -17,9 +17,9 @@ early without interrupting flow for small changes.
 
 3. **Tiered Reviews**: Review depth scales with change size:
    - skip:     <500 chars, 1 file      → no review
-   - quick:    <3000 chars, ≤3 files   → 1 lightweight agent
-   - standard: <15000 chars, ≤6 files  → 3 agents
-   - deep:     ≥15000 chars or >6 files → 4 agents (includes senior reviewer)
+   - quick:    <5000 chars, ≤3 files   → 1 lightweight agent
+   - standard: <20000 chars, ≤6 files  → 3 agents
+   - deep:     ≥20000 chars or >6 files → 4 agents (includes senior reviewer)
 
 4. **Integration Checker**: Added when changes span 2+ top-level directories OR
    touch 2+ critical patterns (services/*, proto/*, etc.) to check API contracts,
@@ -104,6 +104,9 @@ LOG_TRUNCATE_LENGTH = 40
 RETRY_INITIAL_DELAY = 0.1
 RETRY_BACKOFF_FACTOR = 2
 MAX_TRANSCRIPT_CHARS_FOR_API = 50000
+STALE_FILE_CLEANUP_AGE = 86400  # 24 hours in seconds
+MAX_METRICS_LINES = 5000  # Rotate metrics file above this many lines
+MAX_DEBUG_LOG_BYTES = 1_000_000  # 1 MB
 MAX_VIOLATION_FILES = 5
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
@@ -217,6 +220,10 @@ STATE_EXPIRY = 3600     # Seconds - reset state if older than this (1 hour)
 # Useful for testing the review system without needing large diffs
 FORCE_TIER_ENV = "CLAUDE_HOOK_FORCE_TIER"
 
+# Set CLAUDE_HOOK_SKIP=1 to temporarily disable the hook (snooze)
+# Useful when you want to work without reviews for a while
+SKIP_HOOK_ENV = "CLAUDE_HOOK_SKIP"
+
 # -----------------------------------------------------------------------------
 # Metrics Tracking (JSONL format, one event per line)
 # -----------------------------------------------------------------------------
@@ -275,6 +282,59 @@ def log(msg: str) -> None:
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except Exception:
         pass  # Never let logging break the hook
+
+
+def cleanup_stale_files() -> None:
+    """Remove stale state/results files and rotate logs.
+
+    - Deletes state and results files older than STALE_FILE_CLEANUP_AGE (24h)
+    - Truncates metrics file if it exceeds MAX_METRICS_LINES
+    - Truncates debug log if it exceeds MAX_DEBUG_LOG_BYTES
+    """
+    now = time.time()
+
+    try:
+        # Clean up old state and results files
+        for pattern in ("stop-hook-state-*.json", "review-results-*.json"):
+            for f in STATE_DIR.glob(pattern):
+                try:
+                    if now - f.stat().st_mtime > STALE_FILE_CLEANUP_AGE:
+                        f.unlink()
+                        log(f"Cleaned up stale file: {f.name}")
+                except Exception:
+                    pass
+
+        # Rotate metrics file: keep last MAX_METRICS_LINES lines
+        if METRICS_FILE.exists():
+            try:
+                size = METRICS_FILE.stat().st_size
+                if size > 0:
+                    lines = METRICS_FILE.read_text(encoding="utf-8").splitlines()
+                    if len(lines) > MAX_METRICS_LINES:
+                        kept = lines[-MAX_METRICS_LINES:]
+                        METRICS_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                        log(f"Rotated metrics: {len(lines)} -> {len(kept)} lines")
+            except Exception:
+                pass
+
+        # Truncate debug log if too large
+        if DEBUG_FILE.exists():
+            try:
+                if DEBUG_FILE.stat().st_size > MAX_DEBUG_LOG_BYTES:
+                    content = DEBUG_FILE.read_bytes()
+                    # Keep the last half
+                    truncated = content[-(MAX_DEBUG_LOG_BYTES // 2):]
+                    # Find first newline to avoid partial line
+                    nl = truncated.find(b"\n")
+                    if nl != -1:
+                        truncated = truncated[nl + 1:]
+                    DEBUG_FILE.write_bytes(b"[...truncated...]\n" + truncated)
+                    log("Truncated debug log")
+            except Exception:
+                pass
+
+    except Exception:
+        pass  # Never let cleanup break the hook
 
 
 # =============================================================================
@@ -1699,6 +1759,138 @@ If clean: {{"violations": []}}"""
         return {"violations": []}
 
 
+# =============================================================================
+# Main Flow Helpers (deduplicated from main)
+# =============================================================================
+
+
+def _get_continue_message(auto_continue_count: int) -> str:
+    """Return the continuation message based on auto-continue progress."""
+    if auto_continue_count < MAX_AUTO_CONTINUES - 1:
+        return "Continue with implementation. If tasks are finished, identify next logical steps."
+    return "If tasks remain, continue with implementation. Otherwise, identify next logical steps or improvements to consider."
+
+
+def _handle_all_passed(
+    *,
+    session_hash: str,
+    session_key: str,
+    current_total_diff: int,
+    all_files_seen: set[str],
+    tier: str,
+    auto_continue_count: int,
+    violation_history: dict[str, dict],
+) -> None:
+    """Handle the case when all review agents have passed.
+
+    Increments auto_continue_count, saves state, and either allows stop
+    (if max reached) or prints an auto-continue message. Always calls sys.exit(0).
+    """
+    auto_continue_count += 1
+    log(f"All agents passed! auto_continue_count now {auto_continue_count}")
+
+    if auto_continue_count >= MAX_AUTO_CONTINUES:
+        log("Max auto continues reached - marking complete")
+        save_review_state(
+            session_hash=session_hash,
+            session_id=session_key,
+            last_total_diff=current_total_diff,
+            last_files_seen=list(all_files_seen),
+            tier=tier,
+            auto_continue_count=auto_continue_count,
+            fail_count=0,
+            round_id="",
+            passed_agents=[],
+            completed=True,
+            violation_history=violation_history,
+        )
+        sys.exit(0)
+
+    new_round_id = uuid.uuid4().hex[:ROUND_ID_LENGTH]
+    save_review_state(
+        session_hash=session_hash,
+        session_id=session_key,
+        last_total_diff=current_total_diff,
+        last_files_seen=list(all_files_seen),
+        tier=tier,
+        auto_continue_count=auto_continue_count,
+        fail_count=0,
+        round_id=new_round_id,
+        passed_agents=[],
+        completed=False,
+        violation_history=violation_history,
+    )
+    continue_msg = _get_continue_message(auto_continue_count)
+    log(f"Review passed - issuing auto-continue [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}]")
+    print(json.dumps({
+        "decision": "block",
+        "reason": f"All reviews passed. [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] {continue_msg}"
+    }))
+    sys.exit(0)
+
+
+def _handle_deep_failure(
+    *,
+    session_hash: str,
+    session_key: str,
+    current_total_diff: int,
+    all_files_seen: set[str],
+    tier: str,
+    auto_continue_count: int,
+    fail_count: int,
+    round_id: str,
+    passed_agents: list[str],
+    violation_history: dict[str, dict],
+    failed_agents: list[str],
+    agents_results: dict,
+    transcript_path: str,
+    all_modified_files: set[str],
+) -> None:
+    """Handle deep review failure by triggering the plan agent.
+
+    Saves state, generates plan instructions, prints failure message,
+    and calls sys.exit(0).
+    """
+    total_issues = sum(
+        len(data.get("issues", []))
+        for data in agents_results.values()
+        if isinstance(data, dict)
+    )
+    log(f"Deep review failed with {total_issues} issues - triggering plan agent")
+    save_review_state(
+        session_hash=session_hash,
+        session_id=session_key,
+        last_total_diff=current_total_diff,
+        last_files_seen=list(all_files_seen),
+        tier=tier,
+        auto_continue_count=auto_continue_count,
+        fail_count=fail_count,
+        round_id=round_id,
+        passed_agents=passed_agents,
+        completed=False,
+        violation_history=violation_history,
+    )
+    results = read_review_results(transcript_path, session_hash)
+    code_hunks = extract_changed_hunks(
+        transcript_path=transcript_path,
+        start_position=0,
+        files=all_modified_files,
+        max_preview_chars=MAX_PREVIEW_CHARS
+    )
+    plan_instructions = get_plan_agent_instructions(
+        session_hash=session_hash,
+        review_results=results,
+        files=list(all_modified_files),
+        violation_history=violation_history,
+        code_hunks=code_hunks,
+    )
+    print(json.dumps({
+        "decision": "block",
+        "reason": f"⚠️ DEEP REVIEW FAILED: {len(failed_agents)} agent(s) found {total_issues} issue(s).\n\n{plan_instructions}"
+    }))
+    sys.exit(0)
+
+
 def main() -> None:
     """Main entry point for the stop hook.
 
@@ -1712,6 +1904,14 @@ def main() -> None:
     """
     log("=" * 50)
     log("HOOK STARTED")
+
+    # Check for snooze/skip env var
+    if os.environ.get(SKIP_HOOK_ENV, "").strip() == "1":
+        log("Hook skipped via CLAUDE_HOOK_SKIP=1")
+        sys.exit(0)
+
+    # Periodic cleanup of stale files and log rotation
+    cleanup_stale_files()
 
     # -------------------------------------------------------------------------
     # Step 1: Parse input from stdin
@@ -1876,35 +2076,15 @@ def main() -> None:
                 all_agents_passed = all(a in passed_agents for a in required_agents)
 
                 if all_agents_passed and required_agents:
-                    auto_continue_count += 1
-                    log(f"All agents passed! auto_continue_count now {auto_continue_count}")
-
-                    # Save updated state
-                    save_review_state(
+                    _handle_all_passed(
                         session_hash=session_hash,
-                        session_id=session_key,
-                        last_total_diff=current_total_diff,
-                        last_files_seen=list(all_files_seen),
+                        session_key=session_key,
+                        current_total_diff=current_total_diff,
+                        all_files_seen=all_files_seen,
                         tier=old_tier,
                         auto_continue_count=auto_continue_count,
-                        fail_count=0,
-                        round_id="",  # Clear round_id since it's complete
-                        passed_agents=[],
-                        completed=False,
                         violation_history=violation_history,
                     )
-
-                    if auto_continue_count >= MAX_AUTO_CONTINUES:
-                        log("Max auto-continues reached - allowing stop")
-                        sys.exit(0)
-
-                    continue_msg = "Continue with implementation. If tasks are finished, identify next logical steps."
-                    log(f"Review passed - issuing auto-continue [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}]")
-                    print(json.dumps({
-                        "decision": "block",
-                        "reason": f"All reviews passed. [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] {continue_msg}"
-                    }))
-                    sys.exit(0)
                 else:
                     # Some agents failed - check for deep tier plan requirement
                     failed_agents = [
@@ -1912,46 +2092,23 @@ def main() -> None:
                         if isinstance(data, dict) and data.get("status") == "fail"
                     ]
                     if failed_agents and old_tier == "deep":
-                        total_issues = sum(
-                            len(data.get("issues", []))
-                            for data in agents_results.values()
-                            if isinstance(data, dict)
-                        )
                         log(f"  {len(failed_agents)} agent(s) failed: {failed_agents} - triggering plan agent")
-                        # DON'T delete results file - plan agent needs it
-                        save_review_state(
+                        _handle_deep_failure(
                             session_hash=session_hash,
-                            session_id=session_key,
-                            last_total_diff=current_total_diff,
-                            last_files_seen=list(all_files_seen),
+                            session_key=session_key,
+                            current_total_diff=current_total_diff,
+                            all_files_seen=all_files_seen,
                             tier=old_tier,
                             auto_continue_count=auto_continue_count,
                             fail_count=len(failed_agents),
                             round_id=round_id,
                             passed_agents=passed_agents,
-                            completed=False,
                             violation_history=violation_history,
-                        )
-                        # Generate plan agent instructions directly
-                        results = read_review_results(transcript_path, session_hash)
-                        code_hunks = extract_changed_hunks(
+                            failed_agents=failed_agents,
+                            agents_results=agents_results,
                             transcript_path=transcript_path,
-                            start_position=0,
-                            files=all_modified_files,
-                            max_preview_chars=MAX_PREVIEW_CHARS
+                            all_modified_files=all_modified_files,
                         )
-                        plan_instructions = get_plan_agent_instructions(
-                            session_hash=session_hash,
-                            review_results=results,
-                            files=list(all_modified_files),
-                            violation_history=violation_history,
-                            code_hunks=code_hunks,
-                        )
-                        print(json.dumps({
-                            "decision": "block",
-                            "reason": f"⚠️ DEEP REVIEW FAILED: {len(failed_agents)} agent(s) found {total_issues} issue(s).\n\n{plan_instructions}"
-                        }))
-                        sys.exit(0)
 
         # Check if we already issued an auto-continue and should allow stop now
         # (no new changes after auto-continue = user is done)
@@ -2127,51 +2284,26 @@ def main() -> None:
 
                 # Block and trigger plan agent for deep tier failures
                 if tier == "deep":
-                    total_issues = sum(
-                        len(data.get("issues", []))
-                        for data in agents_results.values()
-                        if isinstance(data, dict)
-                    )
-                    log(f"Deep review failed with {total_issues} issues - triggering plan agent")
-                    save_review_state(
+                    _handle_deep_failure(
                         session_hash=session_hash,
-                        session_id=session_key,
-                        last_total_diff=current_total_diff,
-                        last_files_seen=list(all_files_seen),
+                        session_key=session_key,
+                        current_total_diff=current_total_diff,
+                        all_files_seen=all_files_seen,
                         tier=tier,
                         auto_continue_count=auto_continue_count,
                         fail_count=fail_count,
                         round_id=round_id,
                         passed_agents=passed_agents,
-                        completed=False,
                         violation_history=violation_history,
-                    )
-                    # Generate plan agent instructions
-                    code_hunks = extract_changed_hunks(
+                        failed_agents=failed_agents,
+                        agents_results=agents_results,
                         transcript_path=transcript_path,
-                        start_position=0,
-                        files=all_modified_files,
-                        max_preview_chars=MAX_PREVIEW_CHARS
+                        all_modified_files=all_modified_files,
                     )
-                    plan_instructions = get_plan_agent_instructions(
-                        session_hash=session_hash,
-                        review_results=results,
-                        files=list(all_modified_files),
-                        violation_history=violation_history,
-                        code_hunks=code_hunks,
-                    )
-                    print(json.dumps({
-                        "decision": "block",
-                        "reason": f"⚠️ DEEP REVIEW FAILED: {len(failed_agents)} agent(s) found {total_issues} issue(s).\n\n{plan_instructions}"
-                    }))
-                    sys.exit(0)
             else:
                 # Check if all required agents passed
-
                 all_agents_passed = all(a in passed_agents for a in required)
                 if all_agents_passed:
-                    auto_continue_count += 1
-                    log(f"All agents passed! auto_continue_count now {auto_continue_count}")
                     # Log metrics for passed review
                     log_review_metrics(
                         tier=tier,
@@ -2182,49 +2314,15 @@ def main() -> None:
                         fail_count=fail_count,
                         session_id=session_key,
                     )
-
-                    if auto_continue_count >= MAX_AUTO_CONTINUES:
-                        log(f"Max auto continues reached - marking complete")
-                        save_review_state(
-                            session_hash=session_hash,
-                            session_id=session_key,
-                            last_total_diff=current_total_diff,
-                            last_files_seen=list(all_files_seen),
-                            tier=tier,
-                            auto_continue_count=auto_continue_count,
-                            fail_count=0,
-                            round_id="",
-                            passed_agents=[],
-                            completed=True,
-                            violation_history=violation_history,
-                        )
-                        sys.exit(0)
-
-                    # Continue with next round
-                    new_round_id = uuid.uuid4().hex[:ROUND_ID_LENGTH]
-                    save_review_state(
+                    _handle_all_passed(
                         session_hash=session_hash,
-                        session_id=session_key,
-                        last_total_diff=current_total_diff,
-                        last_files_seen=list(all_files_seen),
+                        session_key=session_key,
+                        current_total_diff=current_total_diff,
+                        all_files_seen=all_files_seen,
                         tier=tier,
                         auto_continue_count=auto_continue_count,
-                        fail_count=0,
-                        round_id=new_round_id,
-                        passed_agents=[],
-                        completed=False,
                         violation_history=violation_history,
                     )
-                    # Determine continuation message based on progress
-                    if auto_continue_count < MAX_AUTO_CONTINUES - 1:
-                        continue_msg = "Continue with implementation. If tasks are finished, identify next logical steps."
-                    else:
-                        continue_msg = "If tasks remain, continue with implementation. Otherwise, identify next logical steps or improvements to consider."
-                    print(json.dumps({
-                        "decision": "block",
-                        "reason": f"All reviews passed. [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] {continue_msg}"
-                    }))
-                    sys.exit(0)
 
         # Determine which agents still need to run and get integration context
         required_agents = get_required_agents(tier)
@@ -2237,50 +2335,15 @@ def main() -> None:
 
         if not pending_agents:
             # All agents already passed
-            auto_continue_count += 1
-            log(f"All agents already passed - auto_continue_count now {auto_continue_count}")
-
-            if auto_continue_count >= MAX_AUTO_CONTINUES:
-                log(f"Max auto continues reached - marking complete")
-                save_review_state(
-                    session_hash=session_hash,
-                    session_id=session_key,
-                    last_total_diff=current_total_diff,
-                    last_files_seen=list(all_files_seen),
-                    tier=tier,
-                    auto_continue_count=auto_continue_count,
-                    fail_count=0,
-                    round_id="",
-                    passed_agents=[],
-                    completed=True,
-                    violation_history=violation_history,
-                )
-                sys.exit(0)
-
-            new_round_id = uuid.uuid4().hex[:ROUND_ID_LENGTH]
-            save_review_state(
+            _handle_all_passed(
                 session_hash=session_hash,
-                session_id=session_key,
-                last_total_diff=current_total_diff,
-                last_files_seen=list(all_files_seen),
+                session_key=session_key,
+                current_total_diff=current_total_diff,
+                all_files_seen=all_files_seen,
                 tier=tier,
                 auto_continue_count=auto_continue_count,
-                fail_count=0,
-                round_id=new_round_id,
-                passed_agents=[],
-                completed=False,
                 violation_history=violation_history,
             )
-            # Determine continuation message based on progress
-            if auto_continue_count < MAX_AUTO_CONTINUES - 1:
-                continue_msg = "Continue with implementation. If tasks are finished, identify next logical steps."
-            else:
-                continue_msg = "If tasks remain, continue with implementation. Otherwise, identify next logical steps or improvements to consider."
-            print(json.dumps({
-                "decision": "block",
-                "reason": f"All reviews passed. [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] {continue_msg}"
-            }))
-            sys.exit(0)
 
         # Save state and trigger review
         log(f"Triggering {tier} review, round {round_id}, pending: {pending_agents}")
@@ -2374,11 +2437,7 @@ def main() -> None:
                 completed=False,
                 violation_history=violation_history,
             )
-            # Determine continuation message based on progress
-            if auto_continue_count < MAX_AUTO_CONTINUES - 1:
-                continue_msg = "Continue with your implementation."
-            else:
-                continue_msg = "If tasks remain, continue with the implementation. Otherwise, identify the next logical steps or improvements to consider."
+            continue_msg = _get_continue_message(auto_continue_count)
             print(json.dumps({
                 "decision": "block",
                 "reason": f"Code review passed ({model_name}). No violations found.\n\n[Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] {continue_msg}"
