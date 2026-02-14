@@ -211,6 +211,7 @@ TIER_FILE_LIMITS = {
 # -----------------------------------------------------------------------------
 MAX_AUTO_CONTINUES = 3  # How many passes before allowing stop
 MAX_FAIL_RETRIES = 3    # How many retry rounds when agents find issues
+MAX_REVIEW_ATTEMPTS = 2 # Circuit breaker: treat as pass after this many unparseable attempts
 STATE_EXPIRY = 3600     # Seconds - reset state if older than this (1 hour)
 
 # -----------------------------------------------------------------------------
@@ -1231,6 +1232,7 @@ def save_review_state(
     passed_agents: list[str],
     completed: bool = False,
     violation_history: dict[str, dict] = None,
+    review_attempts: int = 0,
 ) -> None:
     """Save session state to file.
 
@@ -1246,6 +1248,7 @@ def save_review_state(
         passed_agents: List of agent IDs that passed this round.
         completed: Whether the review cycle is complete.
         violation_history: Dict of {file: {category: count}} tracking violations.
+        review_attempts: How many times we've issued instructions for this round_id.
     """
     state = {
         "session_id": session_id,
@@ -1259,6 +1262,7 @@ def save_review_state(
         "passed_agents": passed_agents,
         "completed": completed,
         "violation_history": violation_history or {},
+        "review_attempts": review_attempts,
     }
 
     state_file = get_state_file(session_hash)
@@ -1557,6 +1561,63 @@ def _repair_json(json_str: str) -> str:
     return s
 
 
+def _try_parse_json(json_str: str) -> dict | None:
+    """Try to parse a JSON string, with repair fallback.
+
+    Returns parsed dict on success, None on failure.
+    """
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        log("Attempting JSON repair...")
+        repaired = _repair_json(json_str)
+        try:
+            data = json.loads(repaired)
+            log("JSON repair successful")
+            return data
+        except json.JSONDecodeError as e:
+            log(f"JSON repair failed: {e}")
+            log(f"Original JSON (first 500 chars): {json_str[:500]}")
+            return None
+
+
+def _fallback_extract_results(full_text: str) -> dict | None:
+    """Fallback: scan transcript text for a JSON blob with round_id and agents.
+
+    Handles cases where Claude output results but omitted the markers.
+    Searches for the last JSON object containing both "round_id" and "agents" keys.
+    """
+    import re
+
+    # Find all JSON-like objects that contain "round_id"
+    # Search backwards (most recent first) by reversing matches
+    candidates = []
+    for match in re.finditer(r'\{[^{}]*"round_id"[^{}]*"agents"\s*:\s*\{', full_text):
+        start = match.start()
+        # Try to find the matching closing brace by counting nesting
+        depth = 0
+        end = start
+        for i in range(start, min(start + 5000, len(full_text))):
+            if full_text[i] == '{':
+                depth += 1
+            elif full_text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end > start:
+            candidates.append(full_text[start:end])
+
+    # Try candidates in reverse order (most recent first)
+    for candidate in reversed(candidates):
+        data = _try_parse_json(candidate)
+        if data is not None and isinstance(data.get("agents"), dict):
+            log("Fallback extraction found results without markers")
+            return _validate_results_data(data)
+
+    return None
+
+
 def _extract_results_from_transcript(transcript_path: str) -> dict | None:
     """Extract review results from transcript using markers (inline mode).
 
@@ -1602,35 +1663,22 @@ def _extract_results_from_transcript(transcript_path: str) -> dict | None:
 
     # Find the LAST occurrence (most recent results)
     start_idx = full_text.rfind(RESULTS_START_MARKER)
-    if start_idx == -1:
+    if start_idx != -1:
+        end_idx = full_text.find(RESULTS_END_MARKER, start_idx)
+        if end_idx != -1:
+            json_str = full_text[start_idx + len(RESULTS_START_MARKER):end_idx].strip()
+            data = _try_parse_json(json_str)
+            if data is not None:
+                return _validate_results_data(data)
+            log("Failed to parse JSON between markers")
+        else:
+            log("End marker not found after start marker")
+    else:
         log("Results markers not found in transcript text content")
-        return None
 
-    end_idx = full_text.find(RESULTS_END_MARKER, start_idx)
-    if end_idx == -1:
-        log("End marker not found after start marker")
-        return None
-
-    json_str = full_text[start_idx + len(RESULTS_START_MARKER):end_idx].strip()
-
-    # Try standard parse first
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        log(f"JSON decode error in transcript results: {e}")
-        log("Attempting JSON repair...")
-
-        # Attempt repair
-        repaired = _repair_json(json_str)
-        try:
-            data = json.loads(repaired)
-            log("JSON repair successful")
-        except json.JSONDecodeError as e2:
-            log(f"JSON repair failed: {e2}")
-            log(f"Original JSON (first 500 chars): {json_str[:500]}")
-            return None
-
-    return _validate_results_data(data)
+    # Fallback: scan for JSON containing "round_id" and "agents" without markers
+    # This handles cases where Claude output the results but forgot the markers
+    return _fallback_extract_results(full_text)
 
 
 def _read_results_from_file(session_hash: str) -> dict | None:
@@ -1963,6 +2011,7 @@ def main() -> None:
         completed = False
         old_tier = ""
         violation_history: dict[str, dict] = {}
+        review_attempts = 0
     elif is_stale:
         # Stale state: preserve total diff for incremental calculation, reset review state
         log("Stale state - preserving total diff, resetting review counters")
@@ -1976,6 +2025,7 @@ def main() -> None:
         completed = False
         old_tier = ""
         violation_history = {}
+        review_attempts = 0
     else:
         last_total_diff = state.get("last_total_diff", 0)
         last_files_seen = set(state.get("last_files_seen", []))
@@ -1986,6 +2036,7 @@ def main() -> None:
         completed = state.get("completed", False)
         old_tier = state.get("tier", "")
         violation_history = state.get("violation_history", {})
+        review_attempts = state.get("review_attempts", 0)
 
     log(f"Session: {'NEW' if is_new_session else ('STALE' if is_stale else 'continuing')}, last_total_diff={last_total_diff}")
 
@@ -2345,8 +2396,28 @@ def main() -> None:
                 violation_history=violation_history,
             )
 
+        # Circuit breaker: if we've already issued instructions for this round
+        # and got no parseable results, don't loop forever
+        if round_id == state.get("round_id", "") and review_attempts >= MAX_REVIEW_ATTEMPTS:
+            log(f"Circuit breaker: {review_attempts} attempts for round {round_id} with no parseable results - treating as pass")
+            _handle_all_passed(
+                session_hash=session_hash,
+                session_key=session_key,
+                current_total_diff=current_total_diff,
+                all_files_seen=all_files_seen,
+                tier=tier,
+                auto_continue_count=auto_continue_count,
+                violation_history=violation_history,
+            )
+
+        # Track how many times we issue instructions for this round
+        if round_id == state.get("round_id", ""):
+            review_attempts += 1
+        else:
+            review_attempts = 1
+
         # Save state and trigger review
-        log(f"Triggering {tier} review, round {round_id}, pending: {pending_agents}")
+        log(f"Triggering {tier} review, round {round_id}, pending: {pending_agents} (attempt {review_attempts})")
         save_review_state(
             session_hash=session_hash,
             session_id=session_key,
@@ -2359,6 +2430,7 @@ def main() -> None:
             passed_agents=passed_agents,
             completed=False,
             violation_history=violation_history,
+            review_attempts=review_attempts,
         )
 
         # Extract code hunks for agent context (parse from start since we read full transcript)
