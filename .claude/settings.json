@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "stop": [{
+      "command": "python .claude/hooks/stop-design-audit.py",
+      "timeout": 30000
+    }]
+  }
+}
