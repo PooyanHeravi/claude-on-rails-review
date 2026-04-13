@@ -1,0 +1,22 @@
+{
+    "_doc": "All keys optional. See SETUP.md for full guide. Preset provides defaults; explicit keys override.",
+
+    "preset": "balanced",
+
+    "+critical_patterns": ["/api/", "/models/", "/migrations/"],
+    "+excluded_paths": ["/docs/", "/examples/"],
+
+    "extra_agent_definitions": {
+        "my_custom_agent": {
+            "subagent_type": "general-purpose",
+            "model": "sonnet",
+            "checks": "domain-specific checks here",
+            "context_checks": {
+                "proto": "Check protobuf compatibility"
+            }
+        }
+    },
+    "agent_ids": {
+        "deep": ["explore_haiku", "general_haiku", "bug_hunter", "my_custom_agent", "general_sonnet"]
+    }
+}
