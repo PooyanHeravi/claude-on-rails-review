@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-04-21
+
 ### Added
 - **Context Restoration After Review**: When the hook issues a "continue" or "fix" instruction, it now extracts what Claude was working on before the review interrupted and appends it to the resume message. Includes the last user request (truncated to 200 chars) and last 5 tool actions. This prevents Claude from losing its train of thought after reviews.
 - **Deep Review Auto-Fix Configuration** (`DEEP_AUTO_FIX`): Configurable severity threshold for deep review auto-fixing. Options: `"none"` (default, stop and wait), `"critical"`, `"high"`, `"medium"`, `"all"`. When enabled, deep review failures spawn a subagent to fix qualifying issues by severity instead of stopping.
@@ -35,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - API mode max auto-continues: was block → now silent allow
 
 ### Changed
+- **Quick-tier agent model upgrade**: `explore_haiku` and `general_haiku` now run on `sonnet` instead of `haiku` for better reasoning on code smells, validation gaps, and security issues. Identifiers kept for state compatibility.
 - `MAX_PREVIEW_CHARS` bumped from 300 to 500 for more code context in review agents
 - **Subagent-Based Fixes**: Non-deep tier reviews now instruct Claude to spawn a single general-purpose subagent (model=sonnet) to fix violations, instead of fixing inline. This preserves Claude's main context and train of thought.
 - **Pretty-Printed JSON Results**: Inline results template now shows 2-space indented JSON between markers instead of a single-line blob. Existing parsers handle this transparently via `json.loads()`.
@@ -148,5 +151,6 @@ Changes to these paths always trigger deep review:
 - `/proto/`
 - `/migrations/`
 
-[Unreleased]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/PooyanHeravi/claude-on-rails-review/releases/tag/v1.0.0

@@ -10,7 +10,7 @@ from stop_design_audit.config import AGENT_IDS, STATE_DIR
 AGENT_DEFINITIONS: dict[str, dict] = {
     "explore_haiku": {
         "subagent_type": "Explore",
-        "model": "haiku",
+        "model": "sonnet",
         "checks": "code smells, obvious bugs, hardcoded values, missing error handling",
         "context_checks": {
             "proto": "Check field numbering, message compatibility, enum values",
@@ -19,7 +19,7 @@ AGENT_DEFINITIONS: dict[str, dict] = {
     },
     "general_haiku": {
         "subagent_type": "general-purpose",
-        "model": "haiku",
+        "model": "sonnet",
         "checks": "silent failures (return None/[]), missing validation, security issues (SQL injection, XSS)",
         "context_checks": {
             "api_routes": "Check input validation, error responses, authentication",
