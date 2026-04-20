@@ -28,8 +28,10 @@ bash /path/to/claude-on-rails-review/install.sh
 # In your project root
 mkdir -p .claude/hooks
 
-# Copy the hook script
-cp /path/to/claude-on-rails-review/stop-design-audit.py .claude/hooks/
+# Copy the shim AND the package — they must live together
+cp -r /path/to/claude-on-rails-review/stop-design-audit.py \
+      /path/to/claude-on-rails-review/stop_design_audit \
+      .claude/hooks/
 chmod +x .claude/hooks/stop-design-audit.py
 
 # Create settings
@@ -154,10 +156,10 @@ Shows how many successful reviews before manual approval required.
 
 By default, the hook uses **inline mode** - no extra permissions needed. Claude embeds results in its response with markers.
 
-To use **file mode** (results written to JSON file), edit `stop-design-audit.py`:
+To use **file mode** (results written to JSON file), set `RESULTS_MODE` in [`stop_design_audit/config.py`](stop_design_audit/config.py) or override it in `.claude/hooks/hook-overrides.json`:
 
-```python
-RESULTS_MODE = "file"  # Change from "inline"
+```json
+{ "RESULTS_MODE": "file" }
 ```
 
 Then add permission to `.claude/settings.local.json`:
@@ -172,7 +174,7 @@ Then add permission to `.claude/settings.local.json`:
 
 ### Adjust Review Thresholds
 
-Edit `.claude/hooks/stop-design-audit.py`:
+Edit [`stop_design_audit/config.py`](stop_design_audit/config.py) (or override in `hook-overrides.json`):
 
 ```python
 # Make it more/less strict

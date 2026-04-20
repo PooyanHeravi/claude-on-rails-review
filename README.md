@@ -25,10 +25,17 @@ Keep Claude on the rails with automated, incremental code review that scales wit
 
 ### 1. Install the Hook
 
+The hook is a `stop_design_audit/` Python package plus a `stop-design-audit.py` shim that imports it. The easiest way to install is to run the bundled script from this repo's root:
+
 ```bash
-# Copy to your project's .claude/hooks/ directory
+bash install.sh
+```
+
+Or install manually — both the shim and the package must live in the same directory:
+
+```bash
 mkdir -p .claude/hooks
-cp stop-design-audit.py .claude/hooks/
+cp -r stop-design-audit.py stop_design_audit .claude/hooks/
 ```
 
 ### 2. Configure Claude Code
@@ -79,7 +86,7 @@ The hook allows Claude to continue automatically up to **3 successful review pas
 
 ## ⚙️ Configuration
 
-Edit the `Configuration` section in `stop-design-audit.py`:
+Core defaults live in [`stop_design_audit/config.py`](stop_design_audit/config.py). For project-specific overrides without editing the package, create `.claude/hooks/hook-overrides.json` (see [`hook-overrides.example.json`](hook-overrides.example.json)):
 
 ### Tier Thresholds
 
