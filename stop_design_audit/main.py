@@ -33,7 +33,6 @@ from stop_design_audit.delegated import (
 )
 from stop_design_audit.subagent import run_subagent_mode
 from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
-from stop_design_audit.git_guard import check_and_recover_stash, get_stash_count
 from stop_design_audit.flow import (
     ReviewContext,
     check_circuit_breaker,
@@ -104,7 +103,6 @@ def main() -> None:
     old_tier = state.tier
     old_round_id = state.round_id
     state.detect_session(transcript_path)
-    check_and_recover_stash(state)
 
     # --- Parse transcript ---
     parse_result = parse_transcript_total(transcript_path)
@@ -387,7 +385,6 @@ def _run_agent_mode(state: ReviewState, ctx: ReviewContext, old_round_id: str) -
     state.last_total_diff = ctx.current_total_diff
     state.last_files_seen = ctx.all_files_seen
     state.tier = ctx.tier
-    state.stash_count_at_dispatch = get_stash_count()
     state.save()
 
     code_hunks, import_violations = get_code_hunks_and_violations(ctx)
@@ -476,7 +473,6 @@ def _run_delegated_mode(
     state.delegated_pending = True
     state.delegated_dispatch_time = datetime.now().isoformat()
     state.delegated_blocked_once = False
-    state.stash_count_at_dispatch = get_stash_count()
     state.save()
 
     delegated_message = get_delegated_review_message(

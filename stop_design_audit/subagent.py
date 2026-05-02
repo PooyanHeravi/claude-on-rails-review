@@ -25,7 +25,6 @@ from stop_design_audit.config import (
 )
 from stop_design_audit.delegated import build_coordinator_payload
 from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
-from stop_design_audit.git_guard import get_stash_count
 from stop_design_audit.flow import (
     ReviewContext,
     check_circuit_breaker,
@@ -509,7 +508,6 @@ def run_subagent_mode(
     state.subagent_pending = True
     state.subagent_dispatch_time = datetime.now().isoformat()
     state.subagent_blocked_once = False
-    state.stash_count_at_dispatch = get_stash_count()
     state.save()
 
     block_with_message(

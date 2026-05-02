@@ -38,7 +38,6 @@ class ReviewState:
     subagent_pending: bool = False
     subagent_dispatch_time: str = ""
     subagent_blocked_once: bool = False
-    stash_count_at_dispatch: int = -1
 
     # Transient flags (not persisted)
     is_new_session: bool = False
@@ -81,7 +80,14 @@ class ReviewState:
             obj.subagent_pending = data.get("subagent_pending", False)
             obj.subagent_dispatch_time = data.get("subagent_dispatch_time", "")
             obj.subagent_blocked_once = data.get("subagent_blocked_once", False)
-            obj.stash_count_at_dispatch = data.get("stash_count_at_dispatch", -1)
+            # Legacy ``stash_count_at_dispatch`` field is intentionally
+            # ignored — the count-based stash auto-recovery it powered
+            # was retired (it conflated user stashes with subagent
+            # stashes and corrupted unrelated working trees). The new
+            # protection lives in the global PreToolUse hook
+            # ``~/.claude/hooks/block-subagent-stash.py`` which reports
+            # subagent stashes to the main Claude session without
+            # mutating the working tree.
 
             # Check staleness
             timestamp_str = data.get("timestamp")
@@ -152,7 +158,6 @@ class ReviewState:
         self.subagent_pending = False
         self.subagent_dispatch_time = ""
         self.subagent_blocked_once = False
-        self.stash_count_at_dispatch = -1
 
     def new_round(self) -> str:
         """Generate a new round_id and return it."""
@@ -182,7 +187,6 @@ class ReviewState:
             "subagent_pending": self.subagent_pending,
             "subagent_dispatch_time": self.subagent_dispatch_time,
             "subagent_blocked_once": self.subagent_blocked_once,
-            "stash_count_at_dispatch": self.stash_count_at_dispatch,
         }
         state_file = get_state_file(self.session_hash)
         try:
