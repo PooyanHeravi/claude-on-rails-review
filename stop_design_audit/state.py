@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from stop_design_audit.config import (
     LOG_TRUNCATE_LENGTH,
@@ -19,6 +20,76 @@ from stop_design_audit.config import (
 from stop_design_audit.exit_helpers import log
 
 SAVE_REPLACE_ATTEMPTS = 5
+
+
+# Persisted fields: name -> (accepted JSON types, default). One table drives
+# loading and validation, so a mistyped field is caught up front (and the
+# file quarantined) instead of failing later on every stop.
+_PERSISTED_FIELDS: dict[str, tuple[tuple[type, ...], object]] = {
+    "session_id": ((str,), ""),
+    "last_total_diff": ((int,), 0),
+    "last_files_seen": ((list,), []),
+    "tier": ((str,), ""),
+    "auto_continue_count": ((int,), 0),
+    "fail_count": ((int,), 0),
+    "round_id": ((str,), ""),
+    "passed_agents": ((list,), []),
+    "completed": ((bool,), False),
+    "violation_history": ((dict,), {}),
+    "review_attempts": ((int,), 0),
+    "delegated_pending": ((bool,), False),
+    "delegated_dispatch_time": ((str,), ""),
+    "delegated_blocked_once": ((bool,), False),
+    "subagent_pending": ((bool,), False),
+    "subagent_dispatch_time": ((str,), ""),
+    "review_agents": ((list,), []),
+    "review_diff_chars": ((int,), 0),
+    "review_file_count": ((int,), 0),
+}
+_LIST_OF_STR_FIELDS = {"last_files_seen", "passed_agents", "review_agents"}
+
+
+def _validated_fields(data: dict) -> dict[str, object]:
+    """Typed field values from a state dict. Raises ValueError on any mistype."""
+    out: dict[str, object] = {}
+    for name, (types, default) in _PERSISTED_FIELDS.items():
+        value = data.get(name, default)
+        # bool is an int subclass: an int field must not accept True/False
+        if not isinstance(value, types) or (
+            bool not in types and isinstance(value, bool)
+        ):
+            raise ValueError(f"field {name!r} has type {type(value).__name__}")
+        if name in _LIST_OF_STR_FIELDS and not all(isinstance(v, str) for v in value):
+            raise ValueError(f"field {name!r} must be a list of strings")
+        out[name] = set(value) if name == "last_files_seen" else value
+    return out
+
+
+def _quarantine(state_file: Path, error: Exception) -> ValueError:
+    """Move a corrupt state file aside so it is reported once, not on every stop.
+
+    Returns the ValueError to raise; it always names the corruption, and says
+    so if the move itself failed (e.g. Windows sharing violation).
+    """
+    aside = state_file.with_suffix(f".corrupt-{int(time.time())}")
+    for attempt in range(SAVE_REPLACE_ATTEMPTS):
+        try:
+            os.replace(state_file, aside)
+            return ValueError(
+                f"corrupt state file moved to {aside.name}: {error}. "
+                "Any pending review round in it was NOT reviewed."
+            )
+        except PermissionError:
+            time.sleep(RETRY_INITIAL_DELAY * (attempt + 1))
+        except OSError as move_error:
+            return ValueError(
+                f"corrupt state file {state_file.name}: {error}. Could not move it "
+                f"aside ({move_error}); delete it to recover. NOT reviewed."
+            )
+    return ValueError(
+        f"corrupt state file {state_file.name}: {error}. Could not move it aside "
+        "(file in use); delete it to recover. NOT reviewed."
+    )
 
 
 @dataclass
@@ -66,40 +137,19 @@ class ReviewState:
             data = json.loads(state_file.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("not an object")
+            fields = _validated_fields(data)
+            timestamp_str = data.get("timestamp")
+            if timestamp_str is not None and not isinstance(timestamp_str, str):
+                raise ValueError("'timestamp' must be a string")
+            saved_at = datetime.fromisoformat(timestamp_str) if timestamp_str else None
         except ValueError as e:  # JSONDecodeError is a ValueError
-            # Move it aside so the error is reported once, not on every stop.
-            aside = state_file.with_suffix(f".corrupt-{int(time.time())}")
-            os.replace(state_file, aside)
-            raise ValueError(
-                f"corrupt state file moved to {aside.name}: {e}. "
-                "Any pending review round in it was NOT reviewed."
-            ) from e
+            raise _quarantine(state_file, e) from e
 
-        obj.session_id = data.get("session_id", "")
-        obj.last_total_diff = data.get("last_total_diff", 0)
-        obj.last_files_seen = set(data.get("last_files_seen", []))
-        obj.tier = data.get("tier", "")
-        obj.auto_continue_count = data.get("auto_continue_count", 0)
-        obj.fail_count = data.get("fail_count", 0)
-        obj.round_id = data.get("round_id", "")
-        obj.passed_agents = data.get("passed_agents", [])
-        obj.completed = data.get("completed", False)
-        obj.violation_history = data.get("violation_history", {})
-        obj.review_attempts = data.get("review_attempts", 0)
-        obj.delegated_pending = data.get("delegated_pending", False)
-        obj.delegated_dispatch_time = data.get("delegated_dispatch_time", "")
-        obj.delegated_blocked_once = data.get("delegated_blocked_once", False)
-        obj.subagent_pending = data.get("subagent_pending", False)
-        obj.subagent_dispatch_time = data.get("subagent_dispatch_time", "")
-        obj.review_agents = data.get("review_agents", [])
-        obj.review_diff_chars = data.get("review_diff_chars", 0)
-        obj.review_file_count = data.get("review_file_count", 0)
+        for name, value in fields.items():
+            setattr(obj, name, value)
 
-        timestamp_str = data.get("timestamp")
-        if timestamp_str:
-            age_seconds = (
-                datetime.now() - datetime.fromisoformat(timestamp_str)
-            ).total_seconds()
+        if saved_at is not None:
+            age_seconds = (datetime.now() - saved_at).total_seconds()
             if age_seconds > STATE_EXPIRY:
                 log(
                     f"State stale ({age_seconds:.0f}s > {STATE_EXPIRY}s) - preserving position"

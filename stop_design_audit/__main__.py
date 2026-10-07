@@ -23,6 +23,8 @@ def run(hooks_dir: Path | None = None) -> None:
     # blocking on an unknown flag could loop without bound.
     exit_helpers.STOP_HOOK_ACTIVE = True
     try:
+        # First: it does not depend on the input, and fail_loud cites its log.
+        config.init_paths(hooks_dir)
         input_data = json.loads(sys.stdin.read(), strict=False)
         if not isinstance(input_data, dict):
             raise ValueError("hook input is not a JSON object")
@@ -33,7 +35,6 @@ def run(hooks_dir: Path | None = None) -> None:
                 f"hook input stop_hook_active must be a bool, got {flag!r}"
             )
         exit_helpers.STOP_HOOK_ACTIVE = flag
-        config.init_paths(hooks_dir)
 
         config.validate_env()
         config.load_overrides()
