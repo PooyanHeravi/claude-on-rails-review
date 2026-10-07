@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import NoReturn
 
 from stop_design_audit.agents import get_required_agents
 from stop_design_audit.classify import (
@@ -21,7 +22,12 @@ from stop_design_audit.config import (
     STATUS_PASS,
     effective_deep_auto_fix,
 )
-from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
+from stop_design_audit.exit_helpers import (
+    allow_stop,
+    block_with_message,
+    log,
+    warn_and_allow,
+)
 from stop_design_audit.instructions import (
     GIT_FIX_CONSTRAINT,
     GIT_READONLY_CONSTRAINT,
@@ -59,6 +65,16 @@ def get_continue_message(auto_continue_count: int) -> str:
     return "If tasks remain, continue with implementation. Otherwise, identify next logical steps or improvements to consider."
 
 
+def allow_skipping_edits(ctx: ReviewContext, why: str) -> NoReturn:
+    """Allow the stop; warn visibly if new edits are being marked as seen unreviewed."""
+    if ctx.incremental_diff or ctx.incremental_files:
+        warn_and_allow(
+            f"{why}: {abs(ctx.incremental_diff)} chars across "
+            f"{len(ctx.incremental_files)} new file(s) were NOT reviewed."
+        )
+    allow_stop(why)
+
+
 def check_completion_guards(state: ReviewState, ctx: ReviewContext) -> None:
     """Check completed, max_continues, max_fails. Exits if triggered.
 
@@ -75,7 +91,7 @@ def check_completion_guards(state: ReviewState, ctx: ReviewContext) -> None:
         state.last_files_seen = ctx.all_files_seen
         state.tier = ctx.tier
         state.save()
-        allow_stop("Review cycle already completed")
+        allow_skipping_edits(ctx, "review cycle already completed")
 
     if state.auto_continue_count >= MAX_AUTO_CONTINUES:
         log(f"Max auto continues reached ({MAX_AUTO_CONTINUES}) - allowing stop")
@@ -84,7 +100,7 @@ def check_completion_guards(state: ReviewState, ctx: ReviewContext) -> None:
         state.tier = old_tier or ctx.tier
         state.completed = True
         state.save()
-        allow_stop("Max auto-continues reached")
+        allow_skipping_edits(ctx, "auto-continue limit reached")
 
     if state.fail_count >= MAX_FAIL_RETRIES:
         log(
@@ -108,7 +124,8 @@ def handle_tier_change(state: ReviewState, new_tier: str) -> None:
     if state.tier and state.tier != new_tier:
         log(f"Tier changed ({state.tier} -> {new_tier}) - starting new review round")
         state.passed_agents = []
-        state.fail_count = 0
+        # fail_count is NOT reset here: it bounds the whole hook-forced chain
+        # (State.start_turn resets it per user turn).
         state.round_id = uuid.uuid4().hex[:ROUND_ID_LENGTH]
 
 
@@ -260,7 +277,7 @@ def process_results(
     return True
 
 
-def handle_all_passed(state: ReviewState, ctx: ReviewContext) -> None:
+def handle_all_passed(state: ReviewState, ctx: ReviewContext) -> NoReturn:
     """Handle the case when all review agents have passed. Exits."""
     state.auto_continue_count += 1
     log(f"All agents passed! auto_continue_count now {state.auto_continue_count}")
@@ -301,7 +318,7 @@ def handle_deep_failure(
     ctx: ReviewContext,
     failed_agents: list[str],
     agents_results: dict,
-) -> None:
+) -> NoReturn:
     """Handle deep review failure. Exits."""
     total_issues = sum(
         len(data.get("issues", []))

@@ -19,12 +19,21 @@ def run(hooks_dir: Path | None = None) -> None:
         # When run as `python -m stop_design_audit`, default to CWD
         hooks_dir = Path.cwd()
 
+    # Until the input proves this stop is a fresh turn, errors only warn:
+    # blocking on an unknown flag could loop without bound.
+    exit_helpers.STOP_HOOK_ACTIVE = True
     try:
-        config.init_paths(hooks_dir)
         input_data = json.loads(sys.stdin.read(), strict=False)
         if not isinstance(input_data, dict):
             raise ValueError("hook input is not a JSON object")
-        exit_helpers.STOP_HOOK_ACTIVE = bool(input_data.get("stop_hook_active"))
+        flag = input_data.get("stop_hook_active")
+        if not isinstance(flag, bool):
+            # The loop bounds depend on this flag; never guess it.
+            raise ValueError(
+                f"hook input stop_hook_active must be a bool, got {flag!r}"
+            )
+        exit_helpers.STOP_HOOK_ACTIVE = flag
+        config.init_paths(hooks_dir)
 
         config.validate_env()
         config.load_overrides()

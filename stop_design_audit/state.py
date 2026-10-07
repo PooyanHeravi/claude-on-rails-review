@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from stop_design_audit.config import (
     LOG_TRUNCATE_LENGTH,
+    RETRY_INITIAL_DELAY,
     ROUND_ID_LENGTH,
     STATE_EXPIRY,
     get_state_file,
 )
 from stop_design_audit.exit_helpers import log
+
+SAVE_REPLACE_ATTEMPTS = 5
 
 
 @dataclass
@@ -60,10 +64,16 @@ class ReviewState:
 
         try:
             data = json.loads(state_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            raise ValueError(f"corrupt state file {state_file}: {e}") from e
-        if not isinstance(data, dict):
-            raise ValueError(f"corrupt state file {state_file}: not an object")
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+        except ValueError as e:  # JSONDecodeError is a ValueError
+            # Move it aside so the error is reported once, not on every stop.
+            aside = state_file.with_suffix(f".corrupt-{int(time.time())}")
+            os.replace(state_file, aside)
+            raise ValueError(
+                f"corrupt state file moved to {aside.name}: {e}. "
+                "Any pending review round in it was NOT reviewed."
+            ) from e
 
         obj.session_id = data.get("session_id", "")
         obj.last_total_diff = data.get("last_total_diff", 0)
@@ -198,8 +208,19 @@ class ReviewState:
         # Errors propagate: a failed state write must not pass silently.
         state_file = get_state_file(self.session_hash)
         tmp = state_file.with_suffix(f".tmp{os.getpid()}")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, state_file)
+        try:
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            for attempt in range(SAVE_REPLACE_ATTEMPTS):
+                try:
+                    os.replace(tmp, state_file)
+                    break
+                except PermissionError:
+                    # Windows: another process (e.g. a scavenger) has it open
+                    if attempt == SAVE_REPLACE_ATTEMPTS - 1:
+                        raise
+                    time.sleep(RETRY_INITIAL_DELAY * (attempt + 1))
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def update_violation_history(

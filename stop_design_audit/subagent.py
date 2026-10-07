@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
 
 from stop_design_audit import config
 from stop_design_audit.agents import (
@@ -272,7 +273,7 @@ def _finish_round(state: ReviewState) -> None:
     state.review_attempts = 0
 
 
-def _handle_pass(state: ReviewState, results: dict[str, dict]) -> None:
+def _handle_pass(state: ReviewState, results: dict[str, dict]) -> NoReturn:
     notes = _collect_issues(results)
     _log_round_metrics(state, STATUS_PASS)
     _finish_round(state)
@@ -294,7 +295,7 @@ def _handle_pass(state: ReviewState, results: dict[str, dict]) -> None:
     block_with_message(_get_passed_message(state.auto_continue_count, notes))
 
 
-def _handle_fail(state: ReviewState, results: dict[str, dict]) -> None:
+def _handle_fail(state: ReviewState, results: dict[str, dict]) -> NoReturn:
     failed = [a for a, d in results.items() if d["status"] == STATUS_FAIL]
     issues = _collect_issues(results)
     state.fail_count += len(failed)
@@ -347,12 +348,17 @@ def _handle_fail(state: ReviewState, results: dict[str, dict]) -> None:
     block_with_message(message)
 
 
-def handle_subagent_pending(state: ReviewState) -> None:
+def handle_subagent_pending(state: ReviewState) -> NoReturn:
     """Consume the results of the pending round. Always exits."""
     round_id = state.round_id
     log(f"Subagent round {round_id} pending (attempt {state.review_attempts})")
     if not state.review_agents:
-        raise ValueError(f"pending round {round_id!r} has no reviewers in state")
+        _finish_round(state)
+        state.save()  # discard the broken round so the next stop is clean
+        raise ValueError(
+            f"pending round {round_id!r} has no reviewers in state; discarded, "
+            "its changes were NOT reviewed"
+        )
 
     results: dict[str, dict] = {}
     problems: list[str] = []
@@ -404,7 +410,7 @@ def handle_subagent_pending(state: ReviewState) -> None:
 # =============================================================================
 
 
-def run_subagent_mode(state: ReviewState, ctx: ReviewContext) -> None:
+def run_subagent_mode(state: ReviewState, ctx: ReviewContext) -> NoReturn:
     """Dispatch a new review round. Always exits."""
     check_completion_guards(state, ctx)
     handle_tier_change(state, ctx.tier)

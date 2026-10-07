@@ -30,7 +30,7 @@ def run_hook(transcript_path: Path, env_overrides: dict | None = None) -> tuple[
     env["CLAUDE_HOOK_DEEP_AUTO_FIX"] = "none"
     if env_overrides:
         env.update(env_overrides)
-    input_json = json.dumps({"transcript_path": str(transcript_path)})
+    input_json = json.dumps({"transcript_path": str(transcript_path), "stop_hook_active": False})
     result = subprocess.run(
         [sys.executable, str(HOOK_SCRIPT)],
         input=input_json,

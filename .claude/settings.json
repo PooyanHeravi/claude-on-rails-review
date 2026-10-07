@@ -3,9 +3,12 @@
     "DOCS_LAST_UPDATED_COMMIT": "4e72fcb594e0581516efea35250b6906b64641ea"
   },
   "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 30000
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python .claude/hooks/stop-design-audit.py",
+        "timeout": 30
+      }]
     }]
   }
 }

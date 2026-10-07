@@ -76,6 +76,12 @@ def load_agent_definitions() -> None:
         if not isinstance(defn, dict):
             errors.append(f"extra_agent_definitions.{agent_id} must be an object")
             continue
+        if agent_id in AGENT_DEFINITIONS:
+            errors.append(
+                f"extra_agent_definitions.{agent_id} redefines a built-in agent; "
+                "use review_checklist_file / reviewer_model instead"
+            )
+            continue
         if not AGENT_ID_PATTERN.fullmatch(agent_id):
             # ids become file names and prompt text
             errors.append(

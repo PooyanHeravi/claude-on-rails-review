@@ -31,7 +31,12 @@ from stop_design_audit.delegated import (
     get_delegated_review_message,
     write_coordinator_instructions,
 )
-from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
+from stop_design_audit.exit_helpers import (
+    allow_stop,
+    block_with_message,
+    log,
+    warn_and_allow,
+)
 from stop_design_audit.flow import (
     ReviewContext,
     check_circuit_breaker,
@@ -127,6 +132,11 @@ def main(input_data: dict) -> None:
         state.passed_agents = []
         state.completed = False
         state.save()
+        if incremental_diff or incremental_files:
+            warn_and_allow(
+                f"deep review cycle completed: {abs(incremental_diff)} chars across "
+                f"{len(incremental_files)} new file(s) were NOT reviewed."
+            )
         allow_stop("Deep review cycle completed")
 
     # --- Zero-diff path ---

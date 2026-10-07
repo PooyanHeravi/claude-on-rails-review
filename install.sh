@@ -85,7 +85,8 @@ fi
 # =============================================================================
 # Configure settings.json
 # =============================================================================
-HOOK_CMD="python .claude/hooks/stop-design-audit.py"
+# python3: the interpreter this installer verifies below
+HOOK_CMD="python3 .claude/hooks/stop-design-audit.py"
 
 if [ -f ".claude/settings.json" ]; then
     # Check if hook is already registered
@@ -96,12 +97,12 @@ if [ -f ".claude/settings.json" ]; then
         echo "Merging hook into existing .claude/settings.json..."
         python3 -c "
 import json, sys
+entry = {'hooks': [{'type': 'command', 'command': '$HOOK_CMD', 'timeout': 30}]}
 try:
     with open('.claude/settings.json', 'r') as f:
         settings = json.load(f)
     hooks = settings.setdefault('hooks', {})
     stop_groups = hooks.setdefault('Stop', [])
-    entry = {'hooks': [{'type': 'command', 'command': '$HOOK_CMD', 'timeout': 30}]}
     registered = any(
         'stop-design-audit.py' in h.get('command', '')
         for g in stop_groups for h in g.get('hooks', [])
@@ -128,7 +129,7 @@ except Exception as e:
             echo '    "Stop": [{'
             echo '      "hooks": [{'
             echo '        "type": "command",'
-            echo '        "command": "python .claude/hooks/stop-design-audit.py",'
+            echo '        "command": "python3 .claude/hooks/stop-design-audit.py",'
             echo '        "timeout": 30'
             echo '      }]'
             echo '    }]'
@@ -144,7 +145,7 @@ else
     "Stop": [{
       "hooks": [{
         "type": "command",
-        "command": "python .claude/hooks/stop-design-audit.py",
+        "command": "python3 .claude/hooks/stop-design-audit.py",
         "timeout": 30
       }]
     }]
@@ -248,7 +249,8 @@ fi
 if ! $NON_INTERACTIVE; then
     echo ""
     echo "Testing hook installation..."
-    if python3 .claude/hooks/stop-design-audit.py 2>&1 | grep -q "No transcript_path"; then
+    # Valid input minus transcript_path: the hook must fail loud with this message.
+    if echo '{"stop_hook_active": false}' | python3 .claude/hooks/stop-design-audit.py 2>&1 | grep -q "hook input has no transcript_path"; then
         echo -e "${GREEN}✓${NC} Hook script is executable"
     else
         echo -e "${RED}✗${NC} Hook test failed"

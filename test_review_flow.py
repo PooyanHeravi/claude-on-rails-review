@@ -209,10 +209,18 @@ def test_bug3_exception_fails_loud():
     """[BUG-3 regression] An internal error (corrupt state file) fails loud for both stop_hook_active values."""
     with hook_session() as (transcript, session_hash):
         write_edit_transcript(transcript)
-        state_path_for(session_hash).write_text("{corrupt", encoding="utf-8")
-        if not check_fail_loud_both(transcript, "corrupt state file", label="corrupt state"):
-            return False
-        print("  PASS: corrupt state file -> fail_loud (block, then warn-only)")
+        state_path = state_path_for(session_hash)
+        for active in (False, True):
+            state_path.write_text("{corrupt", encoding="utf-8")
+            code, stdout, stderr = run_hook(transcript, stop_hook_active=active)
+            if code != 0 or not check_fail_loud(stdout, active, "corrupt state file moved to"):
+                return fail(f"corrupt state (active={active}): wrong fail_loud output")
+            # Self-heal: moved aside so the error is reported once, not every stop
+            if state_path.exists():
+                return fail("corrupt state file should be moved aside")
+            if not list(STATE_DIR.glob(f"stop-hook-state-{session_hash}.corrupt-*")):
+                return fail("corrupt state file should be kept as .corrupt-<ts>")
+        print("  PASS: corrupt state file -> fail_loud once, moved aside")
         return True
 
 
@@ -271,10 +279,18 @@ def test_bad_hook_input_fails_loud():
     """Hook input without transcript_path, or not JSON at all, fails loud."""
     if not check_fail_loud_both(None, "no transcript_path", label="no transcript_path"):
         return False
+    # stop_hook_active unknown -> fail loud WITHOUT blocking (no unbounded loop)
     code, stdout, _ = run_hook(None, raw_input="this is not json")
-    if code != 0 or not check_fail_loud(stdout, False, "JSONDecodeError"):
-        return fail("non-JSON hook input must fail loud")
-    print("  PASS: malformed hook input fails loud")
+    if code != 0 or not check_fail_loud(stdout, True, "JSONDecodeError"):
+        return fail("non-JSON hook input must fail loud, warn-only")
+    for label, flag in (("missing flag", None), ("non-bool flag", "yes")):
+        payload = {"transcript_path": "t.jsonl"}
+        if flag is not None:
+            payload["stop_hook_active"] = flag
+        code, stdout, _ = run_hook(None, raw_input=json.dumps(payload))
+        if code != 0 or not check_fail_loud(stdout, True, "stop_hook_active must be a bool"):
+            return fail(f"{label}: must fail loud, warn-only")
+    print("  PASS: malformed hook input fails loud; unknown loop flag never blocks")
     return True
 
 
@@ -465,7 +481,7 @@ def test_deep_auto_fix_none_is_report_only():
         if state.get("completed") is not True or state.get("tier") != "deep":
             return fail(f"report-only deep failure must complete the cycle, got {state}")
         # Next stop with no new edits: the completed deep cycle allows silently.
-        if not expect_silent_allow(*run_hook(transcript, env_overrides=env)):
+        if not expect_silent_allow(*run_hook(transcript, env_overrides=env, stop_hook_active=True)):
             return False
         if read_state_file(state_path_for(session_hash)).get("completed") is not False:
             return fail("completed flag should reset after the deep-completed allow")
@@ -657,9 +673,37 @@ def test_pending_round_without_reviewers_fails_loud():
             return False
         state["review_agents"] = []
         state_path_for(session_hash).write_text(json.dumps(state), encoding="utf-8")
-        if not check_fail_loud_both(transcript, "has no reviewers", label="empty reviewers"):
+        code, stdout, _ = run_hook(transcript)
+        if code != 0 or not check_fail_loud(stdout, False, "has no reviewers"):
+            return fail("empty reviewer list must fail loud")
+        # Self-heal: the broken round is discarded, so the next stop is clean
+        healed = read_state_file(state_path_for(session_hash))
+        if healed.get("subagent_pending") or healed.get("round_id"):
+            return fail(f"broken round should be discarded, got {healed}")
+    print("  PASS: empty reviewer list fails loud once, then self-heals")
+    return True
+
+
+def test_completion_guard_warns_on_unreviewed_edits():
+    """[Review-round regression] Guards that mark new edits as seen must warn, not allow silently."""
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        state = dispatch(transcript, session_hash)
+        if state is None:
             return False
-    print("  PASS: empty reviewer list fails loud")
+        state.update(subagent_pending=False, round_id="", review_agents=[], completed=True)
+        state_path_for(session_hash).write_text(json.dumps(state), encoding="utf-8")
+        write_transcript(transcript, [
+            edit_event("/test/file.py", "x" * 600),
+            edit_event("/test/other.py", "y" * 900),
+        ])
+        code, stdout, _ = run_hook(transcript, stop_hook_active=True)
+        if code != 0 or not stdout:
+            return fail(f"expected a visible warning, got code={code} stdout={stdout!r}")
+        output = json.loads(stdout)
+        if set(output) != {"systemMessage"} or "NOT reviewed" not in output["systemMessage"]:
+            return fail(f"guard must warn about unreviewed edits: {output}")
+    print("  PASS: completion guard warns when it skips new edits")
     return True
 
 
@@ -692,6 +736,9 @@ LAYERS = [
         test_stale_state_keeps_pending_round,
         test_scavenger_never_mutates_other_sessions,
         test_pending_round_without_reviewers_fails_loud,
+    ]),
+    ("Design-audit review findings (round 13479109)", [
+        test_completion_guard_warns_on_unreviewed_edits,
     ]),
 ]
 

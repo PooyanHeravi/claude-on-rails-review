@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Results contract: a `fail` must list issues, and every issue field must be present.
 - Config: `max_*` bounds must be ≥ 1. Agent ids must match `[A-Za-z0-9_-]+` because they become file names. Custom agent field types are validated. The config fingerprint covers custom agents and `review-config.json`.
 - Install and docs: hooks register under `"Stop"` with nested `hooks: [{type: "command", ...}]`, and `timeout` is in seconds (`30`, not `30000`).
+- Loop safety: until the hook input proves `stop_hook_active` is `false`, errors warn without blocking, so they cannot loop. A missing or non-bool `stop_hook_active` is rejected rather than guessed. Tier changes no longer reset `fail_count` within a chain.
+- Guards that mark new edits as seen (cycle completed, auto-continue limit, deep cycle completed) warn that those edits were NOT reviewed instead of allowing silently.
+- Self-heal after one loud failure: a corrupt state file is moved to `.corrupt-<ts>`, and a pending round with no reviewers is discarded. Neither fails on every later stop any more.
+- State save cleans up its temp file and retries Windows sharing violations. The scavenger skips malformed peer state files instead of failing the current session.
+- Config: every integer except `api_diff_threshold` must be ≥ 1. Built-in agent ids cannot be redefined. The fingerprint includes `CLAUDE_HOOK_FORCE_TIER`.
+- install.sh: registers with `python3` (the interpreter it checks for). Its self-test pipes input and matches the current message. A bad settings.json no longer raises a hidden `NameError`. This repo's own `.claude/settings.json` uses the current schema.
 
 ### Changed
 - **Checklist:** the reviewer uses a built-in generic checklist (silent failures, correctness, contracts and integration, security, hardcoding, tests), or a project file set with `review_checklist_file` (relative to the hooks directory, or absolute), which REPLACES the built-in one. A missing file is a config error.

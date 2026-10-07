@@ -276,6 +276,10 @@ _CONFIG_KEYS: dict[str, type] = {
     "api_diff_threshold": int,
 }
 
+# Integer keys where 0 is meaningful; every other integer must be >= 1
+# (0 loop bounds / expiries / timeouts would skip or abandon every review).
+_ZERO_ALLOWED_INT_KEYS = {"api_diff_threshold"}
+
 # Allowed values for enumerated string keys.
 _ENUM_KEYS: dict[str, tuple[str, ...]] = {
     "review_mode": REVIEW_MODES,
@@ -299,7 +303,7 @@ def _validate_value(key: str, value: object) -> list[str]:
     if expected is int:
         # bool is an int subclass; reject it explicitly. Loop bounds of 0
         # would make every round UNREVIEWED or skip review entirely.
-        minimum = 1 if key.startswith("max_") else 0
+        minimum = 0 if key in _ZERO_ALLOWED_INT_KEYS else 1
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             return [f"'{key}' must be an integer >= {minimum}, got {value!r}"]
         return []
@@ -482,6 +486,7 @@ def config_fingerprint() -> str:
     }
     snapshot["review_mode"] = effective_review_mode()
     snapshot["deep_auto_fix"] = effective_deep_auto_fix()
+    snapshot["force_tier"] = os.environ.get(FORCE_TIER_ENV, "").strip().lower()
     snapshot["version"] = __version__
     snapshot["extra_agent_definitions"] = read_overrides_file().get(
         "extra_agent_definitions", {}

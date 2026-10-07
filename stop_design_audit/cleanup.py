@@ -26,6 +26,8 @@ def cleanup_stale_files() -> None:
             "review-results-*.json",
             "review-prompt-*.md",
             "scavenged-*.marker",
+            "stop-hook-state-*.tmp*",
+            "stop-hook-state-*.corrupt-*",
             "coordinator-instructions-*.json",
         ):
             for f in config.STATE_DIR.glob(pattern):
@@ -102,61 +104,71 @@ def scavenge_abandoned_reviews(current_session_hash: str) -> None:
     STATE_EXPIRY; a marker file prevents scoring it twice. If the owner
     returns later, it still consumes the round itself.
     """
-    from stop_design_audit.metrics import log_review_metrics
-    from stop_design_audit.results import read_review_results
-
     for state_file in config.STATE_DIR.glob("stop-hook-state-*.json"):
         file_hash = state_file.stem.replace("stop-hook-state-", "")
         if file_hash == current_session_hash:
             continue
         try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            # Possibly mid-write by its owner; the owner reports corruption.
-            log(f"WARNING: scavenger skipped unreadable {state_file.name}: {e}")
-            continue
-        if not isinstance(data, dict):
-            log(f"WARNING: scavenger skipped non-object {state_file.name}")
-            continue
-        if not (data.get("subagent_pending") or data.get("delegated_pending")):
-            continue
-        round_id = data.get("round_id", "")
-        if not round_id or _scavenge_marker(file_hash, round_id).exists():
-            continue
-        try:
-            age = (
-                datetime.now() - datetime.fromisoformat(data["timestamp"])
-            ).total_seconds()
-        except (KeyError, TypeError, ValueError):
-            log(f"WARNING: scavenger skipped {state_file.name}: no valid timestamp")
-            continue
-        if age < config.STATE_EXPIRY:
-            continue
+            _scavenge_one(state_file, file_hash)
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+            # Another session's malformed file must not fail this session;
+            # its owner reports its own corruption.
+            log(f"WARNING: scavenger skipped malformed {state_file.name}: {e}")
 
-        outcome = "abandoned"
-        if data.get("subagent_pending"):
-            outcome = _scavenge_subagent_outcome(
-                file_hash, round_id, data.get("review_agents", [])
-            )
-        else:
-            session_id = data.get("session_id", "")
-            if session_id and Path(session_id).exists():
-                results = read_review_results(session_id, file_hash, mode="inline")
-                if results.get("round_id") == round_id:
-                    has_failures = any(
-                        isinstance(d, dict) and d.get("status") == "fail"
-                        for d in results.get("agents", {}).values()
-                    )
-                    outcome = "scavenged_fail" if has_failures else "scavenged_pass"
 
-        log_review_metrics(
-            tier=data.get("tier", "unknown"),
-            diff_chars=data.get("review_diff_chars", 0),
-            file_count=data.get("review_file_count", 0),
-            agents=data.get("review_agents", []),
-            outcome=outcome,
-            fail_count=data.get("fail_count", 0),
-            session_id=file_hash,
+def _scavenge_one(state_file: Path, file_hash: str) -> None:
+    """Score one other session's abandoned round, if it has one."""
+    from stop_design_audit.metrics import log_review_metrics
+    from stop_design_audit.results import read_review_results
+
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        # Possibly mid-write by its owner; the owner reports corruption.
+        log(f"WARNING: scavenger skipped unreadable {state_file.name}: {e}")
+        return
+    if not isinstance(data, dict):
+        log(f"WARNING: scavenger skipped non-object {state_file.name}")
+        return
+    if not (data.get("subagent_pending") or data.get("delegated_pending")):
+        return
+    round_id = data.get("round_id", "")
+    if not round_id or _scavenge_marker(file_hash, round_id).exists():
+        return
+    try:
+        age = (
+            datetime.now() - datetime.fromisoformat(data["timestamp"])
+        ).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        log(f"WARNING: scavenger skipped {state_file.name}: no valid timestamp")
+        return
+    if age < config.STATE_EXPIRY:
+        return
+
+    outcome = "abandoned"
+    if data.get("subagent_pending"):
+        outcome = _scavenge_subagent_outcome(
+            file_hash, round_id, data.get("review_agents", [])
         )
-        _scavenge_marker(file_hash, round_id).touch()
-        log(f"Scavenged round {round_id} from {file_hash}: {outcome}")
+    else:
+        session_id = data.get("session_id", "")
+        if session_id and Path(session_id).exists():
+            results = read_review_results(session_id, file_hash, mode="inline")
+            if results.get("round_id") == round_id:
+                has_failures = any(
+                    isinstance(d, dict) and d.get("status") == "fail"
+                    for d in results.get("agents", {}).values()
+                )
+                outcome = "scavenged_fail" if has_failures else "scavenged_pass"
+
+    log_review_metrics(
+        tier=data.get("tier", "unknown"),
+        diff_chars=data.get("review_diff_chars", 0),
+        file_count=data.get("review_file_count", 0),
+        agents=data.get("review_agents", []),
+        outcome=outcome,
+        fail_count=data.get("fail_count", 0),
+        session_id=file_hash,
+    )
+    _scavenge_marker(file_hash, round_id).touch()
+    log(f"Scavenged round {round_id} from {file_hash}: {outcome}")

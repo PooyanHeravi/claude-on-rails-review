@@ -152,12 +152,14 @@ def run_hook(
     transcript_path: Path | None,
     env_overrides: dict | None = None,
     *,
-    stop_hook_active: bool | None = None,
+    stop_hook_active: bool | None = False,
     raw_input: str | None = None,
 ) -> tuple[int, str, str]:
     """Run the hook and return (exit_code, stdout, stderr).
 
-    The caller's CLAUDE_HOOK_* environment is stripped so tests see defaults.
+    Claude Code always sends stop_hook_active; it defaults to False (a fresh
+    turn). Pass None to omit it. The caller's CLAUDE_HOOK_* environment is
+    stripped so tests see defaults.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_HOOK_")}
     if env_overrides:
@@ -179,6 +181,16 @@ def run_hook(
         timeout=30,
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def expect_unreviewed_warning(code: int, stdout: str, stderr: str) -> bool:
+    """Allow with a visible systemMessage that new edits were NOT reviewed."""
+    if code != 0 or not stdout:
+        return fail(f"expected a warning, got code={code} stdout={stdout!r} stderr={stderr[:200]}")
+    output = json.loads(stdout)
+    if set(output) != {"systemMessage"} or "NOT reviewed" not in output["systemMessage"]:
+        return fail(f"expected an UNREVIEWED warning without a block, got {output}")
+    return True
 
 
 def read_state_file(state_path: Path) -> dict | None:
@@ -356,7 +368,7 @@ def test_no_code_modified_silent_exit():
 
 
 def test_completed_flag_resets_on_allow():
-    """When completed=True, hook should allow stop and reset completed to False."""
+    """When completed=True, hook allows the stop (warning about the unreviewed new edits) and resets completed."""
     with hook_session() as (transcript, session_hash):
         write_edit_transcript(transcript)
         state_path = state_path_for(session_hash)
@@ -365,7 +377,7 @@ def test_completed_flag_resets_on_allow():
             completed=True, tier="quick", auto_continue_count=1,
             last_total_diff=50, last_files_seen=["/test/file.py"],
         )
-        if not expect_silent_allow(*run_hook(transcript, stop_hook_active=True)):
+        if not expect_unreviewed_warning(*run_hook(transcript, stop_hook_active=True)):
             return False
         state = read_state_file(state_path)
         if state is None:
@@ -398,7 +410,7 @@ def test_skip_tier_max_continues_saves_state():
 
 
 def test_deep_completed_silent_exit():
-    """Deep review completed flag should trigger silent exit, not block."""
+    """Deep review completed flag allows the stop (warning about unreviewed new edits), never blocks."""
     with hook_session() as (transcript, session_hash):
         write_edit_transcript(transcript, chars=21)
         create_mock_state(
@@ -406,7 +418,7 @@ def test_deep_completed_silent_exit():
             completed=True, tier="deep", auto_continue_count=1,
             last_total_diff=50, last_files_seen=["/test/file.py"],
         )
-        if not expect_silent_allow(*run_hook(transcript, stop_hook_active=True)):
+        if not expect_unreviewed_warning(*run_hook(transcript, stop_hook_active=True)):
             return False
         print("  PASS: Deep completed triggers silent exit")
         return True
