@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from stop_design_audit.config import METRICS_FILE
-from stop_design_audit.exit_helpers import log
+from stop_design_audit import __version__, config
 
 
 def log_review_metrics(
@@ -20,20 +19,20 @@ def log_review_metrics(
 ) -> None:
     """Append review metrics to JSONL file for analysis.
 
-    Never fails — errors are silently swallowed.
+    Every record carries the hook version and config fingerprint
+    (provenance). Write errors propagate to the entry point.
     """
-    try:
-        metric = {
-            "timestamp": datetime.now().isoformat(),
-            "tier": tier,
-            "diff_chars": diff_chars,
-            "file_count": file_count,
-            "agents": agents,
-            "outcome": outcome,
-            "fail_count": fail_count,
-            "session_id": session_id[:8] if len(session_id) >= 8 else session_id,
-        }
-        with open(METRICS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(metric) + "\n")
-    except Exception as e:
-        log(f"Failed to log metrics: {e}")
+    metric = {
+        "timestamp": datetime.now().isoformat(),
+        "version": __version__,
+        "config_fingerprint": config.config_fingerprint(),
+        "tier": tier,
+        "diff_chars": diff_chars,
+        "file_count": file_count,
+        "agents": agents,
+        "outcome": outcome,
+        "fail_count": fail_count,
+        "session_id": session_id[:8] if len(session_id) >= 8 else session_id,
+    }
+    with open(config.METRICS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(metric) + "\n")

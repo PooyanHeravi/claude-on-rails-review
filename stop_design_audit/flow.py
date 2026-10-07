@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from dataclasses import dataclass, field
 
@@ -13,8 +12,6 @@ from stop_design_audit.classify import (
     should_run_integration_review,
 )
 from stop_design_audit.config import (
-    DEEP_AUTO_FIX,
-    DEEP_AUTO_FIX_ENV,
     MAX_AUTO_CONTINUES,
     MAX_FAIL_RETRIES,
     MAX_PREVIEW_CHARS,
@@ -22,6 +19,7 @@ from stop_design_audit.config import (
     ROUND_ID_LENGTH,
     STATUS_FAIL,
     STATUS_PASS,
+    effective_deep_auto_fix,
 )
 from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
 from stop_design_audit.instructions import (
@@ -126,16 +124,22 @@ def get_pending_agents_and_context(
 ) -> tuple[list[str], list[str], dict | None]:
     """Determine required agents, pending agents, and integration context.
 
+    Cross-module changes no longer add a separate agent; the integration
+    context is handed to the reviewer(s) as extra focus. Its values are
+    sorted lists so payloads stay JSON-serializable.
+
     Returns: (required_agents, pending_agents, integration_context)
     """
-    required_agents = get_required_agents(ctx.tier)
+    required_agents = list(get_required_agents(ctx.tier))
     needs_integration, top_dirs, crit_patterns = should_run_integration_review(
         list(ctx.incremental_files)
     )
     integration_context = None
     if needs_integration:
-        required_agents = required_agents + ["integration_checker"]
-        integration_context = {"dirs": top_dirs, "patterns": crit_patterns}
+        integration_context = {
+            "dirs": sorted(top_dirs),
+            "patterns": sorted(crit_patterns),
+        }
 
     pending_agents = [a for a in required_agents if a not in state.passed_agents]
     return required_agents, pending_agents, integration_context
@@ -167,6 +171,7 @@ def get_code_hunks_and_violations(
     return code_hunks, import_violations
 
 
+# TODO(VIOLATION): legacy agent/delegated fail-open — exhausted attempts are treated as a PASS. Subagent mode (default) is fail-loud; delete legacy modes or port them (tracking: v3 design-audit review round 656dfe68).
 def check_circuit_breaker(
     state: ReviewState, ctx: ReviewContext, old_round_id: str
 ) -> None:
@@ -232,7 +237,7 @@ def process_results(
             agents=required,
             outcome=STATUS_FAIL,
             fail_count=state.fail_count,
-            session_id=state.session_id,
+            session_id=state.session_hash,
         )
 
         if ctx.tier == "deep":
@@ -248,7 +253,7 @@ def process_results(
                 agents=required,
                 outcome=STATUS_PASS,
                 fail_count=state.fail_count,
-                session_id=state.session_id,
+                session_id=state.session_hash,
             )
             handle_all_passed(state, ctx)
 
@@ -311,7 +316,7 @@ def handle_deep_failure(
     state.completed = True
     state.save()
 
-    effective_auto_fix = os.environ.get(DEEP_AUTO_FIX_ENV, "").lower() or DEEP_AUTO_FIX
+    effective_auto_fix = effective_deep_auto_fix()
 
     if effective_auto_fix != "none":
         # Auto-fix mode

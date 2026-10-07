@@ -2,28 +2,28 @@
 
 from __future__ import annotations
 
-import json
 import os
-import sys
 from datetime import datetime
 
+from stop_design_audit import exit_helpers
 from stop_design_audit.agents import get_required_agents
 from stop_design_audit.api_mode import call_anthropic_review
 from stop_design_audit.classify import (
     classify_review_tier,
     detect_file_contexts,
     load_module_boundaries,
-    should_run_integration_review,
 )
 from stop_design_audit.cleanup import cleanup_stale_files, scavenge_abandoned_reviews
 from stop_design_audit.config import (
     API_DIFF_THRESHOLD,
+    DELEGATED_TIMEOUT,
     MAX_AUTO_CONTINUES,
     MAX_FAIL_RETRIES,
-    REVIEW_MODE,
-    REVIEW_MODE_ENV,
+    REVIEW_TIERS,
     SKIP_HOOK_ENV,
+    STATUS_FAIL,
     STATUS_PASS,
+    effective_review_mode,
     get_session_hash,
 )
 from stop_design_audit.delegated import (
@@ -31,7 +31,6 @@ from stop_design_audit.delegated import (
     get_delegated_review_message,
     write_coordinator_instructions,
 )
-from stop_design_audit.subagent import run_subagent_mode
 from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
 from stop_design_audit.flow import (
     ReviewContext,
@@ -52,21 +51,18 @@ from stop_design_audit.instructions import (
 )
 from stop_design_audit.results import read_review_results
 from stop_design_audit.state import ReviewState
+from stop_design_audit.subagent import handle_subagent_pending, run_subagent_mode
 from stop_design_audit.transcript import (
     extract_pre_review_context,
     parse_transcript_total,
 )
 
-from stop_design_audit.config import (
-    DELEGATED_TIMEOUT,
-    STATUS_FAIL,
-)
 
-
-def main() -> None:
-    """Main entry point for the stop hook."""
+def main(input_data: dict) -> None:
+    """Main entry point for the stop hook. ``input_data`` is the parsed hook input."""
     log("=" * 50)
     log("HOOK STARTED")
+    log(f"Input keys: {list(input_data.keys())}")
 
     # --- Early exits ---
     if os.environ.get(SKIP_HOOK_ENV, "").strip() == "1":
@@ -74,26 +70,13 @@ def main() -> None:
 
     cleanup_stale_files()
 
-    effective_mode = os.environ.get(REVIEW_MODE_ENV, "").lower().strip() or REVIEW_MODE
-    # Scavenge runs after session hash is computed (see below)
-    if effective_mode not in ("agent", "delegated", "api", "subagent"):
-        log(f"Invalid REVIEW_MODE '{effective_mode}', falling back to 'agent'")
-        effective_mode = "agent"
-
-    # --- Parse input ---
-    try:
-        raw_input = sys.stdin.read()
-        log(f"Stdin: {len(raw_input)} chars")
-        input_data = json.loads(raw_input, strict=False)
-        log(f"Input keys: {list(input_data.keys())}")
-    except Exception as e:
-        log(f"Error reading stdin: {e}")
-        allow_stop("Error reading stdin")
+    # Validated by config.validate_env() before main() runs
+    effective_mode = effective_review_mode()
 
     transcript_path = input_data.get("transcript_path", "")
     log(f"transcript_path from stdin: {transcript_path}")
-    if not transcript_path:
-        allow_stop("No transcript_path in input")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        raise ValueError("hook input has no transcript_path")
 
     # --- Load state ---
     session_hash = get_session_hash(transcript_path)
@@ -103,6 +86,9 @@ def main() -> None:
     old_tier = state.tier
     old_round_id = state.round_id
     state.detect_session(transcript_path)
+    if not exit_helpers.STOP_HOOK_ACTIVE:
+        # First stop of a user turn (not a hook-forced continuation)
+        state.start_turn()
 
     # --- Parse transcript ---
     parse_result = parse_transcript_total(transcript_path)
@@ -119,6 +105,12 @@ def main() -> None:
     log(
         f"Files modified: {len(all_modified_files)}, edits: {parse_result['edit_count']}, writes: {parse_result['write_count']}"
     )
+
+    # --- Pending review round: consume its results before any diff checks.
+    # A foreground reviewer adds no edits to the main transcript, so the
+    # zero-diff exit below would otherwise skip its results.
+    if effective_mode == "subagent" and state.subagent_pending:
+        handle_subagent_pending(state)
 
     # --- Early exit: no code modified ---
     code_modified = "Edit" in parse_result["tools"] or "Write" in parse_result["tools"]
@@ -192,7 +184,7 @@ def main() -> None:
     elif effective_mode == "delegated":
         _run_delegated_mode(state, ctx, old_tier, old_round_id)
     elif effective_mode == "subagent":
-        run_subagent_mode(state, ctx, old_tier, old_round_id)
+        run_subagent_mode(state, ctx)
     else:
         _run_api_mode(state, ctx)
 
@@ -220,15 +212,8 @@ def _handle_zero_diff(
             agents_results = results.get("agents", {})
 
             required_agents = (
-                get_required_agents(old_tier)
-                if old_tier in ("quick", "standard", "deep")
-                else []
+                get_required_agents(old_tier) if old_tier in REVIEW_TIERS else []
             )
-            needs_integration, _, _ = should_run_integration_review(
-                list(state.last_files_seen)
-            )
-            if needs_integration:
-                required_agents = required_agents + ["integration_checker"]
 
             for agent_id, data in agents_results.items():
                 if (

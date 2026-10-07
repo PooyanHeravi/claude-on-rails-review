@@ -1,78 +1,135 @@
 #!/usr/bin/env python3
 """
-Test suite for exit path correctness in stop-design-audit.py.
+Test suite for exit path correctness in the stop-design-audit hook.
 
-Two layers of protection:
-  Layer 1 — Static audit: scans source code for structural violations
-  Layer 2 — Behavioral tests: runs hook with mock state/transcript, verifies stdout/state
+Layers:
+  Layer 1 — Static audit: scans package source for structural violations and
+            checks every exit-helper call against EXIT_PATH_REGISTRY.
+  Layer 2 — Behavioral tests: runs the hook with mock state/transcript and
+            verifies stdout/state.
+  Layer 3 — Delegated mode.
+  Layer 4 — Subagent mode dispatch (the full v3 review flow lives in
+            test_review_flow.py, which reuses the helpers below).
+
+Runtime files live in <hooks_dir>/state/; hooks_dir is this repo root.
 
 Run:  python test_exit_paths.py
 """
+from __future__ import annotations
+
 import ast
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Iterator
 
 HOOK_DIR = Path(__file__).parent
 HOOK_SCRIPT = HOOK_DIR / "stop-design-audit.py"
 PACKAGE_DIR = HOOK_DIR / "stop_design_audit"
+STATE_DIR = HOOK_DIR / "state"
+OVERRIDES_PATH = HOOK_DIR / "hook-overrides.json"
 
-# These constants must match the hook — import them at test time
+# These constants must match the hook defaults (config.py)
 MAX_AUTO_CONTINUES = 3
-MAX_FAIL_RETRIES = 3
+SESSION_HASH_LENGTH = 12
+
+# An edit big enough to land in the quick tier (skip threshold is 500 chars)
+QUICK_EDIT_CHARS = 600
 
 
 def _read_all_package_sources() -> list[tuple[Path, str]]:
     """Read all .py files in the package directory. Returns list of (path, source)."""
-    sources = []
-    for py_file in sorted(PACKAGE_DIR.glob("*.py")):
-        sources.append((py_file, py_file.read_text(encoding="utf-8")))
-    return sources
-
-
-def _combined_package_source() -> str:
-    """Concatenate all package sources for simple text searches."""
-    return "\n".join(src for _, src in _read_all_package_sources())
+    return [(p, p.read_text(encoding="utf-8")) for p in sorted(PACKAGE_DIR.glob("*.py"))]
 
 
 # =============================================================================
-# Helpers
+# Shared helpers (also imported by test_review_flow.py)
 # =============================================================================
+
+def fail(msg: str) -> bool:
+    print(f"  FAIL: {msg}")
+    return False
+
 
 def get_session_hash(transcript_path: str) -> str:
-    return hashlib.md5(transcript_path.encode()).hexdigest()[:12]
+    return hashlib.md5(transcript_path.encode()).hexdigest()[:SESSION_HASH_LENGTH]
 
 
-def create_mock_transcript(path: Path, include_edits: bool = True, include_results: bool = False,
-                           round_id: str = "", agents_results: dict | None = None):
-    """Create a mock JSONL transcript."""
-    entries = []
-    if include_edits:
-        entries.append({
-            "type": "tool_use",
-            "name": "Edit",
-            "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": "new code changes here"}
-        })
-    if include_results and round_id:
-        results_data = {
-            "round_id": round_id,
-            "agents": agents_results or {},
-        }
-        # Simulate inline results marker in assistant message
-        entries.append({
-            "type": "assistant",
-            "content": f"<!--REVIEW_RESULTS_START-->\n{json.dumps(results_data, indent=2)}\n<!--REVIEW_RESULTS_END-->"
-        })
-    with open(path, "w") as f:
-        for entry in entries:
-            f.write(json.dumps(entry) + "\n")
+def state_path_for(session_hash: str) -> Path:
+    return STATE_DIR / f"stop-hook-state-{session_hash}.json"
 
 
-def create_mock_state(state_path: Path, transcript_path: str, **overrides):
+def prompt_path_for(session_hash: str, round_id: str, agent_id: str = "reviewer") -> Path:
+    return STATE_DIR / f"review-prompt-{session_hash}-{round_id}-{agent_id}.md"
+
+
+def results_path_for(session_hash: str, round_id: str, agent_id: str = "reviewer") -> Path:
+    return STATE_DIR / f"review-results-{session_hash}-{round_id}-{agent_id}.json"
+
+
+def coordinator_path_for(session_hash: str) -> Path:
+    return STATE_DIR / f"coordinator-instructions-{session_hash}.json"
+
+
+def cleanup_session(session_hash: str) -> None:
+    """Remove every runtime file the hook wrote for this session."""
+    for f in STATE_DIR.glob(f"*{session_hash}*"):
+        f.unlink(missing_ok=True)
+
+
+@contextmanager
+def hook_session() -> Iterator[tuple[Path, str]]:
+    """Temp transcript path + its session hash; session files removed afterwards."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        transcript = Path(tmpdir) / "transcript.jsonl"
+        session_hash = get_session_hash(str(transcript))
+        try:
+            yield transcript, session_hash
+        finally:
+            cleanup_session(session_hash)
+
+
+@contextmanager
+def overrides_file(content: str) -> Iterator[Path]:
+    """Write hook-overrides.json in the hooks dir; always removed afterwards."""
+    if OVERRIDES_PATH.exists():
+        raise RuntimeError(f"{OVERRIDES_PATH} already exists — refusing to overwrite it")
+    try:
+        OVERRIDES_PATH.write_text(content, encoding="utf-8")
+        yield OVERRIDES_PATH
+    finally:
+        OVERRIDES_PATH.unlink(missing_ok=True)
+
+
+def edit_event(file_path: str, new_string: str, old_string: str = "old") -> dict:
+    return {
+        "type": "tool_use",
+        "name": "Edit",
+        "input": {"file_path": file_path, "old_string": old_string, "new_string": new_string},
+    }
+
+
+def write_transcript(path: Path, events: list[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for event in events:
+            f.write(json.dumps(event) + "\n")
+
+
+def write_edit_transcript(
+    path: Path, files: tuple[str, ...] = ("/test/file.py",), chars: int = QUICK_EDIT_CHARS
+) -> None:
+    """Transcript with one Edit of `chars` characters per file."""
+    write_transcript(path, [edit_event(f, "x" * chars) for f in files])
+
+
+def create_mock_state(state_path: Path, transcript_path: str, **overrides) -> None:
     """Create a mock state file with sensible defaults."""
     state = {
         "session_id": transcript_path,
@@ -87,20 +144,34 @@ def create_mock_state(state_path: Path, transcript_path: str, **overrides):
         "violation_history": {},
     }
     state.update(overrides)
-    with open(state_path, "w") as f:
-        json.dump(state, f, indent=2)
+    state_path.parent.mkdir(exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
-def run_hook(transcript_path: Path, env_overrides: dict | None = None) -> tuple[int, str, str]:
-    """Run the hook and return (exit_code, stdout, stderr)."""
-    import os
-    env = os.environ.copy()
+def run_hook(
+    transcript_path: Path | None,
+    env_overrides: dict | None = None,
+    *,
+    stop_hook_active: bool | None = None,
+    raw_input: str | None = None,
+) -> tuple[int, str, str]:
+    """Run the hook and return (exit_code, stdout, stderr).
+
+    The caller's CLAUDE_HOOK_* environment is stripped so tests see defaults.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_HOOK_")}
     if env_overrides:
         env.update(env_overrides)
-    input_json = json.dumps({"transcript_path": str(transcript_path)})
+    if raw_input is None:
+        payload: dict = {}
+        if transcript_path is not None:
+            payload["transcript_path"] = str(transcript_path)
+        if stop_hook_active is not None:
+            payload["stop_hook_active"] = stop_hook_active
+        raw_input = json.dumps(payload)
     result = subprocess.run(
         [sys.executable, str(HOOK_SCRIPT)],
-        input=input_json,
+        input=raw_input,
         capture_output=True,
         text=True,
         cwd=str(HOOK_DIR),
@@ -114,21 +185,55 @@ def read_state_file(state_path: Path) -> dict | None:
     """Read and return state file contents, or None if missing."""
     if not state_path.exists():
         return None
-    with open(state_path) as f:
-        return json.load(f)
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def expect_block(exit_code: int, stdout: str, stderr: str = "") -> dict | None:
+    """Return the parsed block output, or None (after printing why) if not a block."""
+    if exit_code != 0:
+        fail(f"exit code {exit_code}, expected 0 (stderr: {stderr[:300]})")
+        return None
+    if not stdout:
+        fail("expected a block decision, got empty stdout")
+        return None
+    try:
+        output = json.loads(stdout)
+    except json.JSONDecodeError:
+        fail(f"stdout is not JSON: {stdout[:300]}")
+        return None
+    if output.get("decision") != "block" or "systemMessage" in output:
+        fail(f"expected a plain block, got: {stdout[:400]}")
+        return None
+    return output
+
+
+def expect_silent_allow(exit_code: int, stdout: str, stderr: str = "") -> bool:
+    if exit_code != 0:
+        return fail(f"exit code {exit_code}, expected 0 (stderr: {stderr[:300]})")
+    if stdout:
+        return fail(f"expected silent allow, got: {stdout[:400]}")
+    return True
 
 
 # =============================================================================
 # Layer 1: Static Audit
 # =============================================================================
 
+EXIT_HELPERS = ("allow_stop", "warn_and_allow", "block_with_message", "fail_loud")
+
+
 def test_no_raw_sys_exit():
-    """Verify no raw sys.exit(0) outside helper functions and __main__ entry."""
+    """Verify no raw sys.exit() outside the exit helper functions."""
     violations = []
 
     for py_file, source in _read_all_package_sources():
         tree = ast.parse(source, filename=str(py_file))
-
+        helper_spans = [
+            (n.lineno, n.end_lineno)
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name in EXIT_HELPERS
+            and py_file.name == "exit_helpers.py"
+        ]
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -136,31 +241,15 @@ def test_no_raw_sys_exit():
             if not (isinstance(func, ast.Attribute) and func.attr == "exit"
                     and isinstance(func.value, ast.Name) and func.value.id == "sys"):
                 continue
-            if not (node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == 0):
-                continue
-
-            line = node.lineno
-
-            # Allowed in: allow_stop, block_with_message (exit_helpers.py)
-            in_helper = False
-            for parent_node in ast.walk(tree):
-                if isinstance(parent_node, ast.FunctionDef) and parent_node.name in ("allow_stop", "block_with_message"):
-                    if parent_node.lineno <= line <= parent_node.end_lineno:
-                        in_helper = True
-                        break
-
-            # Allowed in: __main__.py run() function (fatal error handler)
-            in_entry = py_file.name == "__main__.py"
-
-            if not in_helper and not in_entry:
-                violations.append(f"{py_file.name}:{line}")
+            if not any(start <= node.lineno <= end for start, end in helper_spans):
+                violations.append(f"{py_file.name}:{node.lineno}")
 
     if violations:
-        print(f"  FAIL: Found raw sys.exit(0) at: {violations}")
-        print("        All exits must use allow_stop() or block_with_message()")
+        print(f"  FAIL: Found raw sys.exit() at: {violations}")
+        print(f"        All exits must use one of {EXIT_HELPERS}")
         return False
 
-    print("  PASS: No raw sys.exit(0) outside helpers")
+    print("  PASS: No raw sys.exit() outside exit helpers")
     return True
 
 
@@ -171,8 +260,7 @@ def test_no_print_before_allow_stop():
     for py_file, source in _read_all_package_sources():
         lines = source.splitlines()
         for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("allow_stop("):
+            if line.strip().startswith("allow_stop("):
                 for j in range(i - 1, max(i - 6, -1), -1):
                     prev = lines[j].strip()
                     if not prev or prev.startswith("#"):
@@ -190,63 +278,67 @@ def test_no_print_before_allow_stop():
     return True
 
 
-def test_block_with_message_count():
-    """Verify the number of block_with_message() calls matches expected count from registry."""
-    combined = _combined_package_source()
-
-    # Count block_with_message calls across all package files (excluding definitions, comments, docstrings)
-    block_calls = []
+def _helper_call_sites(helper: str) -> list[str]:
+    """Call sites of an exit helper (definitions, comments, docstring lines excluded)."""
+    pattern = re.compile(rf"\b{helper}\(")
+    sites = []
     for py_file, source in _read_all_package_sources():
         for i, line in enumerate(source.splitlines(), 1):
             stripped = line.strip()
-            if stripped.startswith("#") or stripped.startswith('"') or stripped.startswith("'"):
+            if stripped.startswith(("#", '"', "'")) or f"def {helper}" in stripped:
                 continue
-            if "block_with_message(" in stripped and "def block_with_message" not in stripped:
-                block_calls.append(f"{py_file.name}:{i}")
+            if pattern.search(stripped):
+                sites.append(f"{py_file.name}:{i}")
+    return sites
 
-    # Count expected blocks from registry (in exit_helpers.py)
-    registry_source = (PACKAGE_DIR / "exit_helpers.py").read_text(encoding="utf-8")
-    registry_match = re.search(r"EXIT_PATH_REGISTRY\s*=\s*\{", registry_source)
-    if not registry_match:
-        print("  FAIL: Could not find EXIT_PATH_REGISTRY in exit_helpers.py")
+
+def _registry_count(exit_type: str) -> int:
+    from stop_design_audit.exit_helpers import EXIT_PATH_REGISTRY
+
+    return sum(1 for e in EXIT_PATH_REGISTRY.values() if e["type"] == exit_type)
+
+
+def _check_helper_count(helper: str, exit_type: str) -> bool:
+    sites = _helper_call_sites(helper)
+    expected = _registry_count(exit_type)
+    if len(sites) != expected:
+        print(f"  FAIL: Found {len(sites)} {helper}() calls but registry has {expected} '{exit_type}' entries")
+        print(f"        {helper} at: {sites}")
         return False
-
-    expected_blocks = registry_source.count('"type": "block"')
-
-    if len(block_calls) != expected_blocks:
-        print(f"  FAIL: Found {len(block_calls)} block_with_message() calls but registry has {expected_blocks} 'block' entries")
-        print(f"        block_with_message at: {block_calls}")
-        return False
-
-    print(f"  PASS: {len(block_calls)} block_with_message() calls match {expected_blocks} registry 'block' entries")
+    print(f"  PASS: {len(sites)} {helper}() calls match {expected} registry '{exit_type}' entries")
     return True
+
+
+def test_registry_types_known():
+    """Verify every EXIT_PATH_REGISTRY entry has a known exit type."""
+    from stop_design_audit.exit_helpers import EXIT_PATH_REGISTRY
+
+    known = {"allow", "block", "warn", "fail_loud"}
+    unknown = {k: e["type"] for k, e in EXIT_PATH_REGISTRY.items() if e["type"] not in known}
+    if unknown:
+        return fail(f"registry entries with unknown types: {unknown}")
+    print(f"  PASS: all {len(EXIT_PATH_REGISTRY)} registry entries use known types")
+    return True
+
+
+def test_block_with_message_count():
+    """Verify block_with_message() call count matches registry 'block' entries."""
+    return _check_helper_count("block_with_message", "block")
 
 
 def test_allow_stop_count():
-    """Verify the number of allow_stop() calls matches expected count from registry."""
-    allow_calls = []
-    for py_file, source in _read_all_package_sources():
-        for i, line in enumerate(source.splitlines(), 1):
-            stripped = line.strip()
-            if stripped.startswith("#") or stripped.startswith('"') or stripped.startswith("'"):
-                continue
-            if "allow_stop(" in stripped and "def allow_stop" not in stripped:
-                allow_calls.append(f"{py_file.name}:{i}")
+    """Verify allow_stop() call count matches registry 'allow' entries."""
+    return _check_helper_count("allow_stop", "allow")
 
-    registry_source = (PACKAGE_DIR / "exit_helpers.py").read_text(encoding="utf-8")
-    expected_allows = registry_source.count('"type": "allow"')
 
-    # fatal_error uses allow_stop() inside __main__.py, so all allow entries map to allow_stop() calls
-    # But fatal_error's allow_stop is in __main__.py, not exit_helpers.py
-    expected_allow_stop_calls = expected_allows
+def test_warn_and_allow_count():
+    """Verify warn_and_allow() call count matches registry 'warn' entries."""
+    return _check_helper_count("warn_and_allow", "warn")
 
-    if len(allow_calls) != expected_allow_stop_calls:
-        print(f"  FAIL: Found {len(allow_calls)} allow_stop() calls but expected {expected_allow_stop_calls} (registry has {expected_allows} 'allow' entries)")
-        print(f"        allow_stop at: {allow_calls}")
-        return False
 
-    print(f"  PASS: {len(allow_calls)} allow_stop() calls match expected {expected_allow_stop_calls}")
-    return True
+def test_fail_loud_count():
+    """Verify fail_loud() call count matches registry 'fail_loud' entries."""
+    return _check_helper_count("fail_loud", "fail_loud")
 
 
 # =============================================================================
@@ -255,165 +347,69 @@ def test_allow_stop_count():
 
 def test_no_code_modified_silent_exit():
     """Hook should silently allow stop when no Edit/Write tools were used."""
-    print("  Setting up: transcript with no edits...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        create_mock_transcript(transcript, include_edits=False)
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript)
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if stdout:
-                print(f"  FAIL: Expected empty stdout for silent allow, got: {stdout[:200]}")
-                return False
-            print("  PASS: Silent exit when no code modified")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+    with hook_session() as (transcript, _):
+        write_transcript(transcript, [{"type": "assistant", "content": "just talking"}])
+        if not expect_silent_allow(*run_hook(transcript)):
+            return False
+        print("  PASS: Silent exit when no code modified")
+        return True
 
 
 def test_completed_flag_resets_on_allow():
-    """When completed=True and agent mode, hook should allow stop and reset completed to False."""
-    print("  Setting up: completed=True state, agent mode...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        # Need enough chars to exceed skip tier (500 chars) so we reach agent mode completed check
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
+    """When completed=True, hook should allow stop and reset completed to False."""
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        state_path = state_path_for(session_hash)
         create_mock_state(
             state_path, str(transcript),
-            completed=True,
-            tier="quick",
-            auto_continue_count=1,
-            last_total_diff=50,
-            last_files_seen=["/test/file.py"],
+            completed=True, tier="quick", auto_continue_count=1,
+            last_total_diff=50, last_files_seen=["/test/file.py"],
         )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if stdout:
-                print(f"  FAIL: Expected silent exit, got: {stdout[:200]}")
-                return False
-
-            # Check state was updated with completed=False
-            state = read_state_file(state_path)
-            if state is None:
-                print("  FAIL: State file was deleted instead of updated")
-                return False
-            if state.get("completed") is not False:
-                print(f"  FAIL: completed should be False, got: {state.get('completed')}")
-                return False
-
-            print("  PASS: completed flag reset to False on allow stop")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+        if not expect_silent_allow(*run_hook(transcript, stop_hook_active=True)):
+            return False
+        state = read_state_file(state_path)
+        if state is None:
+            return fail("state file was deleted instead of updated")
+        if state.get("completed") is not False:
+            return fail(f"completed should be False, got: {state.get('completed')}")
+        print("  PASS: completed flag reset to False on allow stop")
+        return True
 
 
 def test_skip_tier_max_continues_saves_state():
     """Skip tier at max auto-continues should save state with completed=True and exit silently."""
-    print("  Setting up: skip tier at max-1 auto-continues...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        # Create transcript with a small edit (to trigger skip tier)
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "a", "new_string": "b"}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
+    with hook_session() as (transcript, session_hash):
+        write_transcript(transcript, [edit_event("/test/file.py", "b", old_string="a")])
+        state_path = state_path_for(session_hash)
         create_mock_state(
             state_path, str(transcript),
-            tier="skip",
-            auto_continue_count=MAX_AUTO_CONTINUES - 1,
-            last_total_diff=10,
-            last_files_seen=["/test/file.py"],
+            tier="skip", auto_continue_count=MAX_AUTO_CONTINUES - 1,
+            last_total_diff=0, last_files_seen=[],
         )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if stdout:
-                print(f"  FAIL: Expected silent exit, got: {stdout[:200]}")
-                return False
-
-            # Check state was saved with completed=True
-            state = read_state_file(state_path)
-            if state is None:
-                print("  FAIL: State file missing — should have been saved")
-                return False
-            if state.get("completed") is not True:
-                print(f"  FAIL: completed should be True, got: {state.get('completed')}")
-                return False
-
-            print("  PASS: Skip tier max continues saves state and exits silently")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+        if not expect_silent_allow(*run_hook(transcript, stop_hook_active=True)):
+            return False
+        state = read_state_file(state_path)
+        if state is None:
+            return fail("state file missing — should have been saved")
+        if state.get("completed") is not True:
+            return fail(f"completed should be True, got: {state.get('completed')}")
+        print("  PASS: Skip tier max continues saves state and exits silently")
+        return True
 
 
 def test_deep_completed_silent_exit():
     """Deep review completed flag should trigger silent exit, not block."""
-    print("  Setting up: completed=True, old_tier=deep...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        create_mock_transcript(transcript, include_edits=True)
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript, chars=21)
         create_mock_state(
-            state_path, str(transcript),
-            completed=True,
-            tier="deep",
-            auto_continue_count=1,
-            last_total_diff=50,
-            last_files_seen=["/test/file.py"],
+            state_path_for(session_hash), str(transcript),
+            completed=True, tier="deep", auto_continue_count=1,
+            last_total_diff=50, last_files_seen=["/test/file.py"],
         )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if stdout:
-                print(f"  FAIL: Expected silent exit, got: {stdout[:200]}")
-                return False
-
-            print("  PASS: Deep completed triggers silent exit")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+        if not expect_silent_allow(*run_hook(transcript, stop_hook_active=True)):
+            return False
+        print("  PASS: Deep completed triggers silent exit")
+        return True
 
 
 # =============================================================================
@@ -423,844 +419,244 @@ def test_deep_completed_silent_exit():
 DELEGATED_ENV = {"CLAUDE_HOOK_REVIEW_MODE": "delegated"}
 
 
+def _pending_delegated_state(transcript: Path, session_hash: str, **overrides) -> Path:
+    state_path = state_path_for(session_hash)
+    fields = {
+        "tier": "quick",
+        "round_id": "abc12345",
+        "delegated_pending": True,
+        "delegated_dispatch_time": datetime.now().isoformat(),
+        "delegated_blocked_once": False,
+        "last_total_diff": 0,
+        "last_files_seen": [],
+    }
+    fields.update(overrides)
+    create_mock_state(state_path, str(transcript), **fields)
+    return state_path
+
+
 def test_delegated_dispatches_coordinator():
     """Delegated mode should dispatch coordinator and set delegated_pending=True."""
-    print("  Setting up: delegated mode with enough diff for quick tier...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        output = expect_block(*run_hook(transcript, env_overrides=DELEGATED_ENV))
+        if output is None:
+            return False
+        if "background coordinator" not in output["reason"].lower():
+            return fail("block message should mention 'background coordinator'")
 
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-        instructions_path = HOOK_DIR / f"coordinator-instructions-{session_hash}.json"
+        state = read_state_file(state_path_for(session_hash))
+        if state is None:
+            return fail("state file missing")
+        if not state.get("delegated_pending"):
+            return fail(f"delegated_pending should be True, got: {state.get('delegated_pending')}")
+        if not state.get("delegated_dispatch_time"):
+            return fail("delegated_dispatch_time should be set")
+        if state.get("delegated_blocked_once"):
+            return fail("delegated_blocked_once should be False on dispatch")
 
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message, got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            if output.get("decision") != "block":
-                print(f"  FAIL: Expected 'block' decision, got: {output.get('decision')}")
-                return False
-            if "background coordinator" not in output.get("reason", "").lower():
-                print(f"  FAIL: Block message should mention 'background coordinator'")
-                return False
-
-            # Check state
-            state = read_state_file(state_path)
-            if state is None:
-                print("  FAIL: State file missing")
-                return False
-            if not state.get("delegated_pending"):
-                print(f"  FAIL: delegated_pending should be True, got: {state.get('delegated_pending')}")
-                return False
-            if not state.get("delegated_dispatch_time"):
-                print(f"  FAIL: delegated_dispatch_time should be set")
-                return False
-            if state.get("delegated_blocked_once"):
-                print(f"  FAIL: delegated_blocked_once should be False on dispatch")
-                return False
-
-            # Check instructions file was created
-            if not instructions_path.exists():
-                print("  FAIL: Coordinator instructions file was not created")
-                return False
-            payload = json.loads(instructions_path.read_text())
-            for key in ("tier", "round_id", "pending_agents", "agent_definitions", "code_hunks"):
-                if key not in payload:
-                    print(f"  FAIL: Payload missing key: {key}")
-                    return False
-
-            print("  PASS: Delegated mode dispatches coordinator correctly")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-            instructions_path.unlink(missing_ok=True)
+        instructions_path = coordinator_path_for(session_hash)
+        if not instructions_path.exists():
+            return fail(f"coordinator instructions not created at {instructions_path}")
+        payload = json.loads(instructions_path.read_text(encoding="utf-8"))
+        for key in ("tier", "round_id", "pending_agents", "agent_definitions", "code_hunks"):
+            if key not in payload:
+                return fail(f"payload missing key: {key}")
+        print("  PASS: Delegated mode dispatches coordinator correctly")
+        return True
 
 
 def test_delegated_pending_blocks_once():
     """When coordinator is pending and not blocked yet, should block once with continue message."""
-    print("  Setting up: delegated_pending=True, blocked_once=False...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id="abc12345",
-            delegated_pending=True,
-            delegated_dispatch_time=datetime.now().isoformat(),
-            delegated_blocked_once=False,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message, got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            if output.get("decision") != "block":
-                print(f"  FAIL: Expected 'block' decision, got: {output.get('decision')}")
-                return False
-            if "still running" not in output.get("reason", "").lower():
-                print(f"  FAIL: Message should mention 'still running', got: {output.get('reason', '')[:100]}")
-                return False
-
-            # Check state updated with blocked_once=True
-            state = read_state_file(state_path)
-            if not state.get("delegated_blocked_once"):
-                print(f"  FAIL: delegated_blocked_once should be True after first block")
-                return False
-
-            print("  PASS: Blocks once while waiting for coordinator")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        state_path = _pending_delegated_state(transcript, session_hash)
+        output = expect_block(*run_hook(transcript, env_overrides=DELEGATED_ENV))
+        if output is None:
+            return False
+        if "still running" not in output["reason"].lower():
+            return fail(f"message should mention 'still running', got: {output['reason'][:100]}")
+        state = read_state_file(state_path)
+        if not state.get("delegated_blocked_once"):
+            return fail("delegated_blocked_once should be True after first block")
+        print("  PASS: Blocks once while waiting for coordinator")
+        return True
 
 
 def test_delegated_pending_allows_second_stop():
     """When coordinator is pending and already blocked once, should allow stop (no loop)."""
-    print("  Setting up: delegated_pending=True, blocked_once=True...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id="abc12345",
-            delegated_pending=True,
-            delegated_dispatch_time=datetime.now().isoformat(),
-            delegated_blocked_once=True,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if stdout:
-                print(f"  FAIL: Expected silent exit (allow stop), got: {stdout[:200]}")
-                return False
-
-            print("  PASS: Allows stop after blocking once (no loop)")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        _pending_delegated_state(transcript, session_hash, delegated_blocked_once=True)
+        if not expect_silent_allow(*run_hook(transcript, env_overrides=DELEGATED_ENV)):
+            return False
+        print("  PASS: Allows stop after blocking once (no loop)")
+        return True
 
 
 def test_delegated_pending_with_results():
-    """When coordinator returns results, should process them and reset delegated state."""
-    print("  Setting up: delegated_pending=True with matching results in transcript...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
+    """When coordinator returns passing results, should process them and reset delegated state."""
+    with hook_session() as (transcript, session_hash):
         round_id = "abc12345"
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-            # Add results from coordinator
-            results_data = {
-                "round_id": round_id,
-                "agents": {
-                    "explore_haiku": {"status": "pass", "issues": []},
-                },
-            }
-            f.write(json.dumps({
+        results_data = {"round_id": round_id, "agents": {"reviewer": {"status": "pass", "issues": []}}}
+        write_transcript(transcript, [
+            edit_event("/test/file.py", "x" * QUICK_EDIT_CHARS),
+            {
                 "type": "assistant",
-                "content": f"<!--REVIEW_RESULTS_START-->\n{json.dumps(results_data, indent=2)}\n<!--REVIEW_RESULTS_END-->"
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id=round_id,
-            delegated_pending=True,
-            delegated_dispatch_time=datetime.now().isoformat(),
-            delegated_blocked_once=False,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-
-            # Should either block with auto-continue or allow stop
-            # (depends on auto_continue_count)
-            state = read_state_file(state_path)
-            if state is None:
-                print("  FAIL: State file missing")
-                return False
-            if state.get("delegated_pending"):
-                print(f"  FAIL: delegated_pending should be False after results processed")
-                return False
-
-            print("  PASS: Results processed and delegated state reset")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+                "content": "<!--REVIEW_RESULTS_START-->\n"
+                + json.dumps(results_data, indent=2)
+                + "\n<!--REVIEW_RESULTS_END-->",
+            },
+        ])
+        state_path = _pending_delegated_state(transcript, session_hash, round_id=round_id)
+        output = expect_block(*run_hook(transcript, env_overrides=DELEGATED_ENV))
+        if output is None:
+            return False
+        if "All reviews passed" not in output["reason"]:
+            return fail(f"expected 'All reviews passed', got: {output['reason'][:200]}")
+        state = read_state_file(state_path)
+        if state is None:
+            return fail("state file missing")
+        if state.get("delegated_pending"):
+            return fail("delegated_pending should be False after results processed")
+        if state.get("auto_continue_count") != 1:
+            return fail(f"auto_continue_count should be 1, got {state.get('auto_continue_count')}")
+        print("  PASS: Results processed and delegated state reset")
+        return True
 
 
 def test_delegated_timeout_fallback():
     """When coordinator times out, should fall back to inline agent mode."""
-    print("  Setting up: delegated_pending=True with expired dispatch time...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        # Set dispatch time far in the past (600 seconds ago)
-        from datetime import datetime, timedelta
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
         old_time = (datetime.now() - timedelta(seconds=600)).isoformat()
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id="abc12345",
-            delegated_pending=True,
-            delegated_dispatch_time=old_time,
-            delegated_blocked_once=False,
-            last_total_diff=0,
-            last_files_seen=[],
+        state_path = _pending_delegated_state(
+            transcript, session_hash, delegated_dispatch_time=old_time
         )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message (inline fallback), got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            if output.get("decision") != "block":
-                print(f"  FAIL: Expected 'block' decision for inline fallback, got: {output.get('decision')}")
-                return False
-
-            # The fallback should use inline agent instructions (not delegated)
-            reason = output.get("reason", "")
-            if "background coordinator" in reason.lower():
-                print("  FAIL: Timeout fallback should use inline agent mode, not delegated")
-                return False
-
-            # State should have delegated_pending=False
-            state = read_state_file(state_path)
-            if state and state.get("delegated_pending"):
-                print(f"  FAIL: delegated_pending should be False after timeout")
-                return False
-
-            print("  PASS: Timeout triggers fallback to inline agent mode")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+        output = expect_block(*run_hook(transcript, env_overrides=DELEGATED_ENV))
+        if output is None:
+            return False
+        if "background coordinator" in output["reason"].lower():
+            return fail("timeout fallback should use inline agent mode, not delegated")
+        state = read_state_file(state_path)
+        if state and state.get("delegated_pending"):
+            return fail("delegated_pending should be False after timeout")
+        print("  PASS: Timeout triggers fallback to inline agent mode")
+        return True
 
 
 def test_delegated_message_compact():
     """Delegated block message should be compact (under 25 lines)."""
-    print("  Setting up: delegated mode, checking message size...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-        instructions_path = HOOK_DIR / f"coordinator-instructions-{session_hash}.json"
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message, got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            reason = output.get("reason", "")
-            line_count = len(reason.splitlines())
-
-            if line_count > 25:
-                print(f"  FAIL: Delegated message is {line_count} lines, expected <= 25")
-                return False
-
-            print(f"  PASS: Delegated message is compact ({line_count} lines)")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-            instructions_path.unlink(missing_ok=True)
+    with hook_session() as (transcript, _):
+        write_edit_transcript(transcript)
+        output = expect_block(*run_hook(transcript, env_overrides=DELEGATED_ENV))
+        if output is None:
+            return False
+        line_count = len(output["reason"].splitlines())
+        if line_count > 25:
+            return fail(f"delegated message is {line_count} lines, expected <= 25")
+        print(f"  PASS: Delegated message is compact ({line_count} lines)")
+        return True
 
 
 def test_delegated_payload_completeness():
     """Coordinator payload should contain all required fields."""
-    print("  Setting up: checking payload fields...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-        instructions_path = HOOK_DIR / f"coordinator-instructions-{session_hash}.json"
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=DELEGATED_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not instructions_path.exists():
-                print("  FAIL: Instructions file not created")
-                return False
-
-            payload = json.loads(instructions_path.read_text())
-            required_keys = [
-                "tier", "round_id", "diff_size", "total_file_count",
-                "pending_agents", "agent_definitions", "file_list",
-                "code_hunks", "violation_history", "results_schema",
-            ]
-            missing = [k for k in required_keys if k not in payload]
-            if missing:
-                print(f"  FAIL: Payload missing keys: {missing}")
-                return False
-
-            # Verify results_schema has fail_criteria
-            if "fail_criteria" not in payload.get("results_schema", {}):
-                print("  FAIL: results_schema missing fail_criteria")
-                return False
-
-            print("  PASS: Payload has all required fields")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-            instructions_path.unlink(missing_ok=True)
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        if expect_block(*run_hook(transcript, env_overrides=DELEGATED_ENV)) is None:
+            return False
+        instructions_path = coordinator_path_for(session_hash)
+        if not instructions_path.exists():
+            return fail("instructions file not created")
+        payload = json.loads(instructions_path.read_text(encoding="utf-8"))
+        required_keys = [
+            "tier", "round_id", "diff_size", "total_file_count",
+            "pending_agents", "agent_definitions", "file_list",
+            "code_hunks", "violation_history", "results_schema",
+        ]
+        missing = [k for k in required_keys if k not in payload]
+        if missing:
+            return fail(f"payload missing keys: {missing}")
+        if "fail_criteria" not in payload.get("results_schema", {}):
+            return fail("results_schema missing fail_criteria")
+        print("  PASS: Payload has all required fields")
+        return True
 
 
 # =============================================================================
-# Layer 4: Subagent Mode Tests
+# Layer 4: Subagent Mode Dispatch (default mode)
 # =============================================================================
 
-SUBAGENT_ENV = {"CLAUDE_HOOK_REVIEW_MODE": "subagent"}
+def test_subagent_dispatches_reviewer():
+    """Default (subagent) mode writes the reviewer prompt, marks the round pending, blocks for a foreground run."""
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        output = expect_block(*run_hook(transcript))
+        if output is None:
+            return False
+        reason = output["reason"]
+        if "run_in_background=false" not in reason:
+            return fail(f"dispatch must ask for a foreground run, got: {reason[:300]}")
+        if "run_in_background=true" in reason:
+            return fail("dispatch must not ask for a background run")
 
+        state = read_state_file(state_path_for(session_hash))
+        if state is None:
+            return fail("state file missing")
+        expected = {"subagent_pending": True, "review_agents": ["reviewer"], "review_attempts": 1, "tier": "quick"}
+        for key, value in expected.items():
+            if state.get(key) != value:
+                return fail(f"state[{key!r}] = {state.get(key)!r}, expected {value!r}")
+        if not state.get("round_id") or not state.get("subagent_dispatch_time"):
+            return fail("round_id and subagent_dispatch_time must be set on dispatch")
 
-def test_subagent_dispatches_agent():
-    """Subagent mode should write payload file, set subagent_pending=True, block with spawn message."""
-    print("  Setting up: subagent mode with enough diff for quick tier...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-        instructions_path = HOOK_DIR / f"subagent-instructions-{session_hash}.json"
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message, got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            if output.get("decision") != "block":
-                print(f"  FAIL: Expected 'block' decision, got: {output.get('decision')}")
-                return False
-            if "background agent" not in output.get("reason", "").lower():
-                print(f"  FAIL: Block message should mention 'background agent'")
-                return False
-
-            # Check state
-            state = read_state_file(state_path)
-            if state is None:
-                print("  FAIL: State file missing")
-                return False
-            if not state.get("subagent_pending"):
-                print(f"  FAIL: subagent_pending should be True, got: {state.get('subagent_pending')}")
-                return False
-            if not state.get("subagent_dispatch_time"):
-                print("  FAIL: subagent_dispatch_time should be set")
-                return False
-            if state.get("subagent_blocked_once"):
-                print("  FAIL: subagent_blocked_once should be False on dispatch")
-                return False
-
-            # Check instructions file
-            if not instructions_path.exists():
-                print("  FAIL: Subagent instructions file was not created")
-                return False
-            payload = json.loads(instructions_path.read_text())
-            for key in ("tier", "round_id", "pending_agents", "agent_definitions", "code_hunks"):
-                if key not in payload:
-                    print(f"  FAIL: Payload missing key: {key}")
-                    return False
-
-            print("  PASS: Subagent mode dispatches correctly")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-            instructions_path.unlink(missing_ok=True)
-
-
-def test_subagent_pending_blocks_once():
-    """When subagent is pending and not blocked yet, should block once with in-progress message."""
-    print("  Setting up: subagent_pending=True, blocked_once=False...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id="abc12345",
-            subagent_pending=True,
-            subagent_dispatch_time=datetime.now().isoformat(),
-            subagent_blocked_once=False,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message, got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            if output.get("decision") != "block":
-                print(f"  FAIL: Expected 'block' decision, got: {output.get('decision')}")
-                return False
-            reason = output.get("reason", "").lower()
-            if "in progress" not in reason and "background review" not in reason:
-                print(f"  FAIL: Message should mention 'in progress', got: {output.get('reason', '')[:100]}")
-                return False
-
-            state = read_state_file(state_path)
-            if not state.get("subagent_blocked_once"):
-                print("  FAIL: subagent_blocked_once should be True after first block")
-                return False
-
-            print("  PASS: Blocks once while waiting for subagent")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-
-
-def test_subagent_pending_allows_second_stop():
-    """When subagent is pending and already blocked once, should allow stop (no loop)."""
-    print("  Setting up: subagent_pending=True, blocked_once=True...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id="abc12345",
-            subagent_pending=True,
-            subagent_dispatch_time=datetime.now().isoformat(),
-            subagent_blocked_once=True,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if stdout:
-                print(f"  FAIL: Expected silent exit (allow stop), got: {stdout[:200]}")
-                return False
-
-            print("  PASS: Allows stop after blocking once (no loop)")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-
-
-def test_subagent_results_pass():
-    """When background agent returns results in transcript, should process and reset pending."""
-    print("  Setting up: subagent_pending=True with passing results in transcript...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        round_id = "abc12345"
-        results_data = {
-            "round_id": round_id,
-            "agents": {
-                "explore_haiku": {"status": "pass", "issues": []},
-            },
-            "outcome": "pass",
-        }
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-            # Background agent's return value in transcript (inline markers)
-            f.write(json.dumps({
-                "type": "assistant",
-                "content": f"<!--REVIEW_RESULTS_START-->\n{json.dumps(results_data, indent=2)}\n<!--REVIEW_RESULTS_END-->"
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id=round_id,
-            subagent_pending=True,
-            subagent_dispatch_time=datetime.now().isoformat(),
-            subagent_blocked_once=False,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-
-            # Should have processed results
-            state = read_state_file(state_path)
-            if state is None:
-                print("  FAIL: State file missing")
-                return False
-            if state.get("subagent_pending"):
-                print("  FAIL: subagent_pending should be False after results processed")
-                return False
-
-            print("  PASS: Subagent results processed from transcript")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-
-
-def test_subagent_timeout_fallback():
-    """When subagent times out, should fall back to inline agent mode."""
-    print("  Setting up: subagent_pending=True with expired dispatch time...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-
-        from datetime import datetime, timedelta
-        old_time = (datetime.now() - timedelta(seconds=600)).isoformat()
-        create_mock_state(
-            state_path, str(transcript),
-            tier="quick",
-            round_id="abc12345",
-            subagent_pending=True,
-            subagent_dispatch_time=old_time,
-            subagent_blocked_once=False,
-            last_total_diff=0,
-            last_files_seen=[],
-        )
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message (inline fallback), got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            if output.get("decision") != "block":
-                print(f"  FAIL: Expected 'block' decision for inline fallback, got: {output.get('decision')}")
-                return False
-
-            # The fallback should use inline agent instructions (not subagent dispatch)
-            reason = output.get("reason", "")
-            if "background agent" in reason.lower() and "spawn" in reason.lower():
-                print("  FAIL: Timeout fallback should use inline agent mode, not subagent dispatch")
-                return False
-
-            state = read_state_file(state_path)
-            if state and state.get("subagent_pending"):
-                print("  FAIL: subagent_pending should be False after timeout")
-                return False
-
-            print("  PASS: Timeout triggers fallback to inline agent mode")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
+        prompt_path = prompt_path_for(session_hash, state["round_id"])
+        if not prompt_path.exists():
+            return fail(f"reviewer prompt not written at {prompt_path}")
+        if prompt_path.name not in reason:
+            return fail("block message must point the reviewer at its prompt file")
+        prompt = prompt_path.read_text(encoding="utf-8")
+        if results_path_for(session_hash, state["round_id"]).name not in prompt:
+            return fail("prompt must name the results file the reviewer writes")
+        print("  PASS: Subagent mode dispatches one foreground reviewer")
+        return True
 
 
 def test_subagent_message_compact():
     """Subagent dispatch message should be very compact (under 8 lines)."""
-    print("  Setting up: subagent mode, checking message size...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-        instructions_path = HOOK_DIR / f"subagent-instructions-{session_hash}.json"
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not stdout:
-                print("  FAIL: Expected block message, got empty stdout")
-                return False
-
-            output = json.loads(stdout)
-            reason = output.get("reason", "")
-            line_count = len(reason.splitlines())
-
-            if line_count > 8:
-                print(f"  FAIL: Subagent message is {line_count} lines, expected <= 8")
-                return False
-
-            print(f"  PASS: Subagent message is compact ({line_count} lines)")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-            instructions_path.unlink(missing_ok=True)
-
-
-def test_subagent_payload_has_autonomous_fields():
-    """Subagent payload should have deep_auto_fix, background_agent_instructions, session_hash."""
-    print("  Setting up: checking subagent-specific payload fields...")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        transcript = tmpdir / "transcript.jsonl"
-        big_new = "x" * 600
-        with open(transcript, "w") as f:
-            f.write(json.dumps({
-                "type": "tool_use",
-                "name": "Edit",
-                "input": {"file_path": "/test/file.py", "old_string": "old", "new_string": big_new}
-            }) + "\n")
-
-        session_hash = get_session_hash(str(transcript))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
-        instructions_path = HOOK_DIR / f"subagent-instructions-{session_hash}.json"
-
-        try:
-            exit_code, stdout, stderr = run_hook(transcript, env_overrides=SUBAGENT_ENV)
-
-            if exit_code != 0:
-                print(f"  FAIL: Exit code {exit_code}, expected 0")
-                return False
-            if not instructions_path.exists():
-                print("  FAIL: Instructions file not created")
-                return False
-
-            payload = json.loads(instructions_path.read_text())
-
-            # Subagent-specific fields
-            subagent_keys = [
-                "session_hash", "deep_auto_fix",
-                "autonomous_deep_failure", "background_agent_instructions",
-            ]
-            missing = [k for k in subagent_keys if k not in payload]
-            if missing:
-                print(f"  FAIL: Payload missing subagent-specific keys: {missing}")
-                return False
-
-            # Verify background_agent_instructions is substantial
-            instructions = payload.get("background_agent_instructions", "")
-            if len(instructions) < 100:
-                print(f"  FAIL: background_agent_instructions too short ({len(instructions)} chars)")
-                return False
-
-            # Also verify coordinator fields are present
-            coordinator_keys = ["tier", "round_id", "pending_agents", "agent_definitions", "code_hunks"]
-            missing = [k for k in coordinator_keys if k not in payload]
-            if missing:
-                print(f"  FAIL: Payload missing coordinator keys: {missing}")
-                return False
-
-            print("  PASS: Payload has all subagent-specific and coordinator fields")
-            return True
-        finally:
-            state_path.unlink(missing_ok=True)
-            instructions_path.unlink(missing_ok=True)
+    with hook_session() as (transcript, _):
+        write_edit_transcript(transcript)
+        output = expect_block(*run_hook(transcript))
+        if output is None:
+            return False
+        line_count = len(output["reason"].splitlines())
+        if line_count > 8:
+            return fail(f"subagent message is {line_count} lines, expected <= 8")
+        print(f"  PASS: Subagent message is compact ({line_count} lines)")
+        return True
 
 
 # =============================================================================
 # Runner
 # =============================================================================
 
-def main():
-    print("\n" + "=" * 60)
-    print("Exit Path Audit & Tests")
-    print("=" * 60)
-
-    results = []
-
-    # Layer 1: Static audit
-    print("\n--- Layer 1: Static Audit ---")
-    for test_fn in [
+LAYERS = [
+    ("Layer 1: Static Audit", [
         test_no_raw_sys_exit,
         test_no_print_before_allow_stop,
+        test_registry_types_known,
         test_block_with_message_count,
         test_allow_stop_count,
-    ]:
-        print(f"\n{test_fn.__doc__}")
-        results.append((test_fn.__name__, test_fn()))
-
-    # Layer 2: Behavioral tests
-    print("\n--- Layer 2: Behavioral Tests ---")
-    for test_fn in [
+        test_warn_and_allow_count,
+        test_fail_loud_count,
+    ]),
+    ("Layer 2: Behavioral Tests", [
         test_no_code_modified_silent_exit,
         test_completed_flag_resets_on_allow,
         test_skip_tier_max_continues_saves_state,
         test_deep_completed_silent_exit,
-    ]:
-        print(f"\n{test_fn.__doc__}")
-        results.append((test_fn.__name__, test_fn()))
-
-    # Layer 3: Delegated mode tests
-    print("\n--- Layer 3: Delegated Mode Tests ---")
-    for test_fn in [
+    ]),
+    ("Layer 3: Delegated Mode Tests", [
         test_delegated_dispatches_coordinator,
         test_delegated_pending_blocks_once,
         test_delegated_pending_allows_second_stop,
@@ -1268,36 +664,43 @@ def main():
         test_delegated_timeout_fallback,
         test_delegated_message_compact,
         test_delegated_payload_completeness,
-    ]:
-        print(f"\n{test_fn.__doc__}")
-        results.append((test_fn.__name__, test_fn()))
-
-    # Layer 4: Subagent mode tests
-    print("\n--- Layer 4: Subagent Mode Tests ---")
-    for test_fn in [
-        test_subagent_dispatches_agent,
-        test_subagent_pending_blocks_once,
-        test_subagent_pending_allows_second_stop,
-        test_subagent_results_pass,
-        test_subagent_timeout_fallback,
+    ]),
+    ("Layer 4: Subagent Mode Dispatch", [
+        test_subagent_dispatches_reviewer,
         test_subagent_message_compact,
-        test_subagent_payload_has_autonomous_fields,
-    ]:
-        print(f"\n{test_fn.__doc__}")
-        results.append((test_fn.__name__, test_fn()))
+    ]),
+]
 
-    # Summary
+
+def run_layers(title: str, layers: list) -> None:
+    """Run test layers, print a summary, exit non-zero on any failure."""
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
+
+    results = []
+    for layer_name, tests in layers:
+        print(f"\n--- {layer_name} ---")
+        for test_fn in tests:
+            print(f"\n{test_fn.__doc__}")
+            try:
+                ok = bool(test_fn())
+            except Exception as e:  # a crashing test is a failing test, not a silent skip
+                ok = fail(f"{test_fn.__name__} raised {type(e).__name__}: {e}")
+            results.append((test_fn.__name__, ok))
+
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     passed = sum(1 for _, r in results if r)
-    total = len(results)
     for name, result in results:
-        status = "PASS" if result else "FAIL"
-        print(f"  {status}: {name}")
-    print(f"\nTotal: {passed}/{total} tests passed")
+        print(f"  {'PASS' if result else 'FAIL'}: {name}")
+    print(f"\nTotal: {passed}/{len(results)} tests passed")
+    sys.exit(0 if passed == len(results) else 1)
 
-    sys.exit(0 if passed == total else 1)
+
+def main():
+    run_layers("Exit Path Audit & Tests", LAYERS)
 
 
 if __name__ == "__main__":

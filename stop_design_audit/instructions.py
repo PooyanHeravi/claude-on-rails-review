@@ -7,39 +7,37 @@ import os
 from stop_design_audit.agents import AGENT_DEFINITIONS
 from stop_design_audit.classify import severities_at_or_above
 from stop_design_audit.config import (
-    DEEP_AUTO_FIX,
-    DEEP_AUTO_FIX_ENV,
     MAX_AUTO_CONTINUES,
     MAX_FAIL_RETRIES,
     MAX_FILES_IN_PROMPT,
     MAX_VIOLATION_FILES,
     RESULTS_MODE,
+    effective_deep_auto_fix,
+    get_agent_mode_results_file,
 )
 from stop_design_audit.transcript import normalize_path
 
 # ---------------------------------------------------------------------------
-# Git working tree protection constraints
+# Git constraints injected into review-subagent prompts.
+#
+# Family policy: subagents never touch git — branch, stash, commit and reset
+# operations belong to the apex session, because a subagent mutating branch or
+# stash state corrupts the checkout the main session is working in. The
+# `block-subagent-stash` PreToolUse guard enforces this at the tool layer;
+# stating it in the prompt keeps an agent from burning turns on calls that
+# will be denied.
 # ---------------------------------------------------------------------------
 
 GIT_READONLY_CONSTRAINT = (
-    "\n\nCRITICAL CONSTRAINT — READ-ONLY REVIEW:\n"
-    "Do NOT run any git commands that modify the working tree or index. "
-    "Prohibited: git stash, git reset, git checkout, git clean, git restore, "
-    "git rm, git mv, git apply, git merge, git rebase, git pull, git cherry-pick, "
-    "git add, git commit. "
-    "Review code ONLY from the provided hunks, file_list, and transcript data. "
-    "Use the Read tool to inspect files — never git commands. "
-    "Violating this will destroy uncommitted user work."
+    "\n\nGit: do NOT run any git command (including status/diff/log). "
+    "Read code with Read/Grep/Glob instead and report what you find — "
+    "all git operations belong to the main session."
 )
 
 GIT_FIX_CONSTRAINT = (
-    "\n\nCRITICAL CONSTRAINT — NO GIT WORKING TREE COMMANDS:\n"
-    "Do NOT run any git commands that modify the working tree or index. "
-    "Prohibited: git stash, git reset, git checkout, git clean, git restore, "
-    "git rm, git mv, git apply, git merge, git rebase, git pull, git cherry-pick, "
-    "git add, git commit. "
-    "You MAY use Edit/Write tools to fix code and read-only git commands (git diff, git log). "
-    "Violating this will destroy uncommitted user work."
+    "\nThe fix subagent edits files only — it must NOT run any git command. "
+    "Committing, stashing, branching or resetting from a subagent corrupts "
+    "the main session's checkout; leave every git operation to the main session."
 )
 
 
@@ -153,9 +151,9 @@ def get_review_instructions(
             context_checks[ctx] for ctx in file_contexts if ctx in context_checks
         ]
 
-        if agent_id == "integration_checker" and integration_context:
-            dirs = integration_context.get("dirs", set())
-            patterns = integration_context.get("patterns", set())
+        if integration_context:
+            dirs = integration_context["dirs"]
+            patterns = integration_context["patterns"]
             if len(dirs) >= 2:
                 context_additions.append(f"Cross-directory: {', '.join(sorted(dirs))}")
             if len(patterns) >= 2:
@@ -206,7 +204,7 @@ Fail if: critical issue OR 2+ high issues"""
     if RESULTS_MODE == "file":
         results_instruction = f'''
 
-Write results to .claude/hooks/review-results-{session_hash}.json:
+Write results to {str(get_agent_mode_results_file(session_hash)).replace(chr(92), "/")}:
 {{"round_id": "{round_id}", "agents": {{"<agent_id>": {{"status": "...", "issues": [...]}}}}}}
 
 {results_schema}'''
@@ -244,9 +242,7 @@ Output results (no files). Use 2-space indented JSON:
 
     # Post-review instruction
     if tier == "deep":
-        effective_auto_fix = (
-            os.environ.get(DEEP_AUTO_FIX_ENV, "").lower() or DEEP_AUTO_FIX
-        )
+        effective_auto_fix = effective_deep_auto_fix()
         if effective_auto_fix == "none":
             post_review_instruction = "After reviews complete, report findings. DO NOT FIX. Stop and wait for user."
         else:

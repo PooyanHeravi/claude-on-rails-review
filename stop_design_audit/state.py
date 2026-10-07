@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,7 +38,9 @@ class ReviewState:
     delegated_blocked_once: bool = False
     subagent_pending: bool = False
     subagent_dispatch_time: str = ""
-    subagent_blocked_once: bool = False
+    review_agents: list[str] = field(default_factory=list)
+    review_diff_chars: int = 0
+    review_file_count: int = 0
 
     # Transient flags (not persisted)
     is_new_session: bool = False
@@ -45,72 +48,55 @@ class ReviewState:
 
     @classmethod
     def from_file(cls, session_hash: str) -> ReviewState:
-        """Load state from disk. Returns fresh state if file missing or invalid."""
+        """Load state from disk. Fresh state if the file is missing.
+
+        A corrupt state file raises — resetting silently would drop a
+        pending review round.
+        """
         state_file = get_state_file(session_hash)
         obj = cls(session_hash=session_hash)
-
         if not state_file.exists():
             return obj
 
         try:
-            content = state_file.read_text()
-            if not content.strip():
-                return obj
-
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                log("State file is not a dict")
-                return obj
-
-            # Populate from file
-            obj.session_id = data.get("session_id", "")
-            obj.last_total_diff = data.get("last_total_diff", 0)
-            obj.last_files_seen = set(data.get("last_files_seen", []))
-            obj.tier = data.get("tier", "")
-            obj.auto_continue_count = data.get("auto_continue_count", 0)
-            obj.fail_count = data.get("fail_count", 0)
-            obj.round_id = data.get("round_id", "")
-            obj.passed_agents = data.get("passed_agents", [])
-            obj.completed = data.get("completed", False)
-            obj.violation_history = data.get("violation_history", {})
-            obj.review_attempts = data.get("review_attempts", 0)
-            obj.delegated_pending = data.get("delegated_pending", False)
-            obj.delegated_dispatch_time = data.get("delegated_dispatch_time", "")
-            obj.delegated_blocked_once = data.get("delegated_blocked_once", False)
-            obj.subagent_pending = data.get("subagent_pending", False)
-            obj.subagent_dispatch_time = data.get("subagent_dispatch_time", "")
-            obj.subagent_blocked_once = data.get("subagent_blocked_once", False)
-            # Legacy ``stash_count_at_dispatch`` field is intentionally
-            # ignored — the count-based stash auto-recovery it powered
-            # was retired (it conflated user stashes with subagent
-            # stashes and corrupted unrelated working trees). The new
-            # protection lives in the global PreToolUse hook
-            # ``~/.claude/hooks/block-subagent-stash.py`` which reports
-            # subagent stashes to the main Claude session without
-            # mutating the working tree.
-
-            # Check staleness
-            timestamp_str = data.get("timestamp")
-            if timestamp_str:
-                try:
-                    ts = datetime.fromisoformat(timestamp_str)
-                    age_seconds = (datetime.now() - ts).total_seconds()
-                    if age_seconds > STATE_EXPIRY:
-                        log(
-                            f"State stale ({age_seconds:.0f}s > {STATE_EXPIRY}s) - preserving position"
-                        )
-                        obj.is_stale = True
-                except ValueError:
-                    pass
-
-            return obj
-
+            data = json.loads(state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
-            log(f"State file is malformed JSON: {e}")
-            return cls(session_hash=session_hash)
-        except Exception as e:
-            log(f"Error reading state file: {e}")
-            return cls(session_hash=session_hash)
+            raise ValueError(f"corrupt state file {state_file}: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError(f"corrupt state file {state_file}: not an object")
+
+        obj.session_id = data.get("session_id", "")
+        obj.last_total_diff = data.get("last_total_diff", 0)
+        obj.last_files_seen = set(data.get("last_files_seen", []))
+        obj.tier = data.get("tier", "")
+        obj.auto_continue_count = data.get("auto_continue_count", 0)
+        obj.fail_count = data.get("fail_count", 0)
+        obj.round_id = data.get("round_id", "")
+        obj.passed_agents = data.get("passed_agents", [])
+        obj.completed = data.get("completed", False)
+        obj.violation_history = data.get("violation_history", {})
+        obj.review_attempts = data.get("review_attempts", 0)
+        obj.delegated_pending = data.get("delegated_pending", False)
+        obj.delegated_dispatch_time = data.get("delegated_dispatch_time", "")
+        obj.delegated_blocked_once = data.get("delegated_blocked_once", False)
+        obj.subagent_pending = data.get("subagent_pending", False)
+        obj.subagent_dispatch_time = data.get("subagent_dispatch_time", "")
+        obj.review_agents = data.get("review_agents", [])
+        obj.review_diff_chars = data.get("review_diff_chars", 0)
+        obj.review_file_count = data.get("review_file_count", 0)
+
+        timestamp_str = data.get("timestamp")
+        if timestamp_str:
+            age_seconds = (
+                datetime.now() - datetime.fromisoformat(timestamp_str)
+            ).total_seconds()
+            if age_seconds > STATE_EXPIRY:
+                log(
+                    f"State stale ({age_seconds:.0f}s > {STATE_EXPIRY}s) - preserving position"
+                )
+                obj.is_stale = True
+
+        return obj
 
     def detect_session(self, transcript_path: str) -> None:
         """Detect if this is a new session, stale session, or continuing session.
@@ -133,6 +119,11 @@ class ReviewState:
             self.last_total_diff = 0
             self.last_files_seen = set()
             self._reset_review_counters()
+        elif self.is_stale and self.subagent_pending:
+            # A pending round's edits were baselined at dispatch: keep the
+            # round so it is consumed (or surfaced as UNREVIEWED), not dropped.
+            log("Stale state with a pending round - keeping the round")
+            self.session_id = session_key
         elif self.is_stale:
             # Stale — preserve diff baseline, reset review counters
             log("Stale state - preserving diff, resetting review counters")
@@ -141,6 +132,17 @@ class ReviewState:
         else:
             # Continuing session
             self.session_id = session_key
+
+    def start_turn(self) -> None:
+        """Reset the per-turn loop bounds at the first stop of a user turn.
+
+        auto_continue_count / fail_count / completed bound CONSECUTIVE
+        hook-forced continuations. Carried across turns they would disable
+        review for the rest of the session once exhausted.
+        """
+        self.auto_continue_count = 0
+        self.fail_count = 0
+        self.completed = False
 
     def _reset_review_counters(self) -> None:
         """Reset review-specific counters."""
@@ -157,7 +159,9 @@ class ReviewState:
         self.delegated_blocked_once = False
         self.subagent_pending = False
         self.subagent_dispatch_time = ""
-        self.subagent_blocked_once = False
+        self.review_agents = []
+        self.review_diff_chars = 0
+        self.review_file_count = 0
 
     def new_round(self) -> str:
         """Generate a new round_id and return it."""
@@ -186,13 +190,16 @@ class ReviewState:
             "delegated_blocked_once": self.delegated_blocked_once,
             "subagent_pending": self.subagent_pending,
             "subagent_dispatch_time": self.subagent_dispatch_time,
-            "subagent_blocked_once": self.subagent_blocked_once,
+            "review_agents": self.review_agents,
+            "review_diff_chars": self.review_diff_chars,
+            "review_file_count": self.review_file_count,
         }
+        # Atomic replace: a killed hook must not leave a torn state file.
+        # Errors propagate: a failed state write must not pass silently.
         state_file = get_state_file(self.session_hash)
-        try:
-            state_file.write_text(json.dumps(data, indent=2))
-        except Exception as e:
-            log(f"Error saving state: {e}")
+        tmp = state_file.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, state_file)
 
 
 def update_violation_history(

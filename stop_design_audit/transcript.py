@@ -96,46 +96,39 @@ def parse_transcript_total(transcript_path: str) -> dict:
         "write_count": 0,
     }
 
-    try:
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
+    # A missing/unreadable transcript raises: it must not read as "no edits".
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            tool_uses = _extract_tool_uses(event)
+            for tool_data in tool_uses:
+                tool_name = tool_data.get("name") or tool_data.get("tool_name")
+                if tool_name:
+                    result["tools"].add(tool_name)
+
+                tool_input = tool_data.get("input", {})
+                if not isinstance(tool_input, dict):
                     continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
 
-                tool_uses = _extract_tool_uses(event)
-                for tool_data in tool_uses:
-                    tool_name = tool_data.get("name") or tool_data.get("tool_name")
-                    if tool_name:
-                        result["tools"].add(tool_name)
+                if tool_name == "Edit":
+                    chars, file_path = _calculate_edit_diff(tool_input)
+                    result["total_diff_chars"] += chars
+                    if file_path:
+                        result["files_modified"].add(file_path)
+                        result["edit_count"] += 1
 
-                    tool_input = tool_data.get("input", {})
-                    if not isinstance(tool_input, dict):
-                        continue
-
-                    if tool_name == "Edit":
-                        chars, file_path = _calculate_edit_diff(tool_input)
-                        result["total_diff_chars"] += chars
-                        if file_path:
-                            result["files_modified"].add(file_path)
-                            result["edit_count"] += 1
-
-                    elif tool_name == "Write":
-                        chars, file_path = _calculate_write_diff(tool_input)
-                        result["total_diff_chars"] += chars
-                        if file_path:
-                            result["files_modified"].add(file_path)
-                            result["write_count"] += 1
-
-    except FileNotFoundError:
-        log(f"Transcript file not found: {transcript_path}")
-    except PermissionError:
-        log(f"Permission denied reading transcript: {transcript_path}")
-    except Exception as e:
-        log(f"Error parsing transcript: {e}")
+                elif tool_name == "Write":
+                    chars, file_path = _calculate_write_diff(tool_input)
+                    result["total_diff_chars"] += chars
+                    if file_path:
+                        result["files_modified"].add(file_path)
+                        result["write_count"] += 1
 
     return result
 

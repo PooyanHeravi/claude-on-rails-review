@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import os
 
+from stop_design_audit import config
 from stop_design_audit.config import (
     CRITICAL_PATTERNS,
     FORCE_TIER_ENV,
+    REVIEW_TIERS,
     SEVERITY_ORDER,
-    STATE_DIR,
     TIER_FILE_LIMITS,
     TIER_THRESHOLDS,
+    ConfigError,
 )
 from stop_design_audit.exit_helpers import log
 from stop_design_audit.transcript import normalize_path
@@ -55,16 +57,22 @@ def should_run_integration_review(files: list[str]) -> tuple[bool, set[str], set
 
 
 def load_review_config() -> dict:
-    """Load review config from .claude/review-config.json."""
-    config_path = STATE_DIR.parent / "review-config.json"
+    """Load review config from .claude/review-config.json (missing = {})."""
+    config_path = config.CONFIG_DIR.parent / "review-config.json"
     if not config_path.exists():
-        log("No review-config.json found")
         return {}
     try:
-        return json.loads(config_path.read_text())
-    except Exception as e:
-        log(f"Error loading review config: {e}")
-        return {}
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ConfigError([f"{config_path}: cannot parse: {e}"]) from e
+    if not isinstance(data, dict):
+        raise ConfigError([f"{config_path}: top level must be an object"])
+    force_tier = data.get("force_tier", "")
+    if force_tier and force_tier not in REVIEW_TIERS:
+        raise ConfigError(
+            [f"{config_path}: force_tier must be one of {list(REVIEW_TIERS)}"]
+        )
+    return data
 
 
 def load_module_boundaries() -> dict:
@@ -124,15 +132,16 @@ def classify_review_tier(
     Returns: "skip", "quick", "standard", or "deep"
     """
     # Check for config file override first
-    config = load_review_config()
-    config_tier = config.get("force_tier", "").lower()
-    if config_tier in ("deep", "standard", "quick"):
+    review_config = load_review_config()
+    config_tier = review_config.get("force_tier", "")
+    if config_tier:
         log(f"Tier forced via review-config.json: {config_tier}")
         return config_tier
 
     # Check for environment variable override
-    forced_tier = os.environ.get(FORCE_TIER_ENV, "").lower()
-    if forced_tier in ("deep", "standard", "quick"):
+    # Validated by config.validate_env()
+    forced_tier = os.environ.get(FORCE_TIER_ENV, "").strip().lower()
+    if forced_tier:
         log(f"Tier forced via {FORCE_TIER_ENV}: {forced_tier}")
         return forced_tier
 

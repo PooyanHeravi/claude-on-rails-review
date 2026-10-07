@@ -1,22 +1,26 @@
 {
-    "_doc": "All keys optional. See SETUP.md for full guide. Preset provides defaults; explicit keys override.",
+    "_doc": "All keys optional. Copy to .claude/hooks/hook-overrides.json. The file is validated on every run: unknown keys, wrong types, bad enum values, unknown presets and undefined agents are fatal and visible. See SETUP.md and CONFIGURATION.md.",
+    "_comment": "Preset provides defaults; explicit keys override it. To use a project checklist add \"review_checklist_file\": \"review-checklist.md\" (relative to .claude/hooks/, or absolute); the file must exist and replaces the built-in checklist.",
 
     "preset": "balanced",
+
+    "reviewer_model": "opus",
+    "fixer_model": "sonnet",
 
     "+critical_patterns": ["/api/", "/models/", "/migrations/"],
     "+excluded_paths": ["/docs/", "/examples/"],
 
     "extra_agent_definitions": {
-        "my_custom_agent": {
+        "security_checker": {
             "subagent_type": "general-purpose",
             "model": "sonnet",
-            "checks": "domain-specific checks here",
+            "checks": "authentication and authorization gaps, injection, secrets in code or logs",
             "context_checks": {
-                "proto": "Check protobuf compatibility"
+                "api_routes": "Check auth middleware, input validation, rate limiting"
             }
         }
     },
     "agent_ids": {
-        "deep": ["explore_haiku", "general_haiku", "bug_hunter", "my_custom_agent", "general_sonnet"]
+        "deep": ["reviewer", "security_checker"]
     }
 }

@@ -10,11 +10,87 @@ from stop_design_audit.config import (
     RESULTS_MODE,
     RETRY_BACKOFF_FACTOR,
     RETRY_INITIAL_DELAY,
+    SEVERITY_ORDER,
     STATUS_FAIL,
     STATUS_PASS,
+    get_agent_mode_results_file,
     get_results_file,
 )
 from stop_design_audit.exit_helpers import log
+
+
+class ResultsError(Exception):
+    """A reviewer's results file exists but violates the results contract."""
+
+
+_ISSUE_FIELDS: dict[str, tuple[type, ...]] = {
+    "file": (str,),
+    "line": (int, type(None)),
+    "severity": (str,),
+    "category": (str,),
+    "description": (str,),
+}
+
+
+def read_reviewer_result(
+    session_hash: str, round_id: str, agent_id: str
+) -> dict | None:
+    """Read and strictly validate one reviewer's results file.
+
+    Returns None if the file does not exist yet. Raises ResultsError if it
+    exists but is not exactly the agreed contract — no repair, no partial
+    acceptance.
+    """
+    path = get_results_file(session_hash, round_id, agent_id)
+    if not path.exists():
+        return None
+    where = f"{agent_id}: {path.name}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ResultsError(f"{where} is not valid UTF-8 JSON ({e})") from e
+    if not isinstance(data, dict):
+        raise ResultsError(f"{where} top level must be an object")
+    if data.get("round_id") != round_id:
+        raise ResultsError(
+            f"{where} round_id is {data.get('round_id')!r}, expected {round_id!r}"
+        )
+    if data.get("agent_id") != agent_id:
+        raise ResultsError(
+            f"{where} agent_id is {data.get('agent_id')!r}, expected {agent_id!r}"
+        )
+    if data.get("status") not in (STATUS_PASS, STATUS_FAIL):
+        raise ResultsError(f"{where} status must be 'pass' or 'fail'")
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        raise ResultsError(f"{where} issues must be a list")
+    for n, issue in enumerate(issues):
+        if not isinstance(issue, dict):
+            raise ResultsError(f"{where} issues[{n}] must be an object")
+        for field, types in _ISSUE_FIELDS.items():
+            value = issue.get(field)
+            if (
+                field not in issue
+                or not isinstance(value, types)
+                or isinstance(value, bool)
+            ):
+                raise ResultsError(
+                    f"{where} issues[{n}].{field} is missing or mistyped"
+                )
+        if issue["severity"] not in SEVERITY_ORDER:
+            raise ResultsError(
+                f"{where} issues[{n}].severity must be one of {SEVERITY_ORDER}"
+            )
+    if data["status"] == STATUS_FAIL and not issues:
+        raise ResultsError(f"{where} status is 'fail' but lists no issues")
+    severities = [i["severity"] for i in issues]
+    must_fail = "critical" in severities or severities.count("high") >= 2
+    if must_fail and data["status"] != STATUS_FAIL:
+        raise ResultsError(
+            f"{where} status is 'pass' but issues meet the fail criteria"
+        )
+    return {"status": data["status"], "issues": issues}
+
 
 # Markers for inline results in transcript
 RESULTS_START_MARKER = "<!--REVIEW_RESULTS_START-->"
@@ -56,6 +132,7 @@ def _validate_results_data(data: dict) -> dict | None:
             if validate_agent_result(agent_id, agent_data):
                 valid_agents[agent_id] = agent_data
             else:
+                # TODO(VIOLATION): legacy agent/delegated fail-open — invalid agent results are dropped, not rejected. Subagent mode (default) is fail-loud; delete legacy modes or port them (tracking: v3 design-audit review round 656dfe68).
                 log(f"Skipping invalid agent result: {agent_id}")
         data["agents"] = valid_agents
     return data
@@ -193,8 +270,8 @@ def _extract_results_from_transcript(transcript_path: str) -> dict | None:
 
 
 def _read_results_from_file(session_hash: str) -> dict | None:
-    """Read review results from JSON file (file mode)."""
-    results_file = get_results_file(session_hash)
+    """Read review results from JSON file (agent mode, results_mode='file')."""
+    results_file = get_agent_mode_results_file(session_hash)
     if not results_file.exists():
         return None
     try:
@@ -211,6 +288,7 @@ def _read_results_from_file(session_hash: str) -> dict | None:
         return None
 
 
+# TODO(VIOLATION): legacy agent/delegated fail-open — read failures return {} (indistinguishable from 'no results yet'). Subagent mode (default) is fail-loud; delete legacy modes or port them (tracking: v3 design-audit review round 656dfe68).
 def read_review_results(
     transcript_path: str, session_hash: str, *, mode: str | None = None
 ) -> dict:
