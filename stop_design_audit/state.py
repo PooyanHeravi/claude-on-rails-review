@@ -61,6 +61,19 @@ def _validated_fields(data: dict) -> dict[str, object]:
             raise ValueError(f"field {name!r} has type {type(value).__name__}")
         if name in _LIST_OF_STR_FIELDS and not all(isinstance(v, str) for v in value):
             raise ValueError(f"field {name!r} must be a list of strings")
+        if name == "violation_history" and not all(
+            isinstance(f, str)
+            and isinstance(cats, dict)
+            and cats
+            and all(
+                isinstance(c, str) and isinstance(n, int) and not isinstance(n, bool)
+                for c, n in cats.items()
+            )
+            for f, cats in value.items()
+        ):
+            raise ValueError(
+                "field 'violation_history' must map file -> {category: count}"
+            )
         out[name] = set(value) if name == "last_files_seen" else value
     return out
 
@@ -142,6 +155,9 @@ class ReviewState:
             if timestamp_str is not None and not isinstance(timestamp_str, str):
                 raise ValueError("'timestamp' must be a string")
             saved_at = datetime.fromisoformat(timestamp_str) if timestamp_str else None
+            if saved_at is not None and saved_at.tzinfo is not None:
+                # save() writes naive local time; an aware value can't be compared
+                raise ValueError("'timestamp' must be a naive local ISO time")
         except ValueError as e:  # JSONDecodeError is a ValueError
             raise _quarantine(state_file, e) from e
 

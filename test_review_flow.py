@@ -231,6 +231,9 @@ CONFIG_CASES = [
     ("bad deep_auto_fix", json.dumps({"deep_auto_fix": "everything"}), "'deep_auto_fix' must be one of"),
     ("wrong type", json.dumps({"max_auto_continues": "3"}), "'max_auto_continues' must be an integer >= 1"),
     ("zero loop bound", json.dumps({"max_review_attempts": 0}), "'max_review_attempts' must be an integer >= 1"),
+    ("redefine reviewer", json.dumps({"extra_agent_definitions": {"reviewer": {
+        "subagent_type": "general-purpose", "model": "haiku", "checks": "x"}}}),
+     "redefines a built-in agent"),
     ("bad agent id", json.dumps({"extra_agent_definitions": {"../evil": {
         "subagent_type": "general-purpose", "model": "opus", "checks": "x"}}}), "must match"),
     ("bad JSON", "{not json", "cannot parse"),
@@ -712,6 +715,9 @@ FIELD_CORRUPTION_CASES = [
     ("string counter", {"auto_continue_count": "3"}),
     ("non-list files", {"last_files_seen": 7}),
     ("bool as int", {"fail_count": True}),
+    ("tz-aware timestamp", {"timestamp": "2026-10-07T10:00:00+00:00"}),
+    ("empty violation categories", {"violation_history": {"a.py": {}}}),
+    ("non-dict violation entry", {"violation_history": {"a.py": 3}}),
 ]
 
 
@@ -796,6 +802,37 @@ def test_input_error_log_is_written():
     return True
 
 
+def test_tier_change_keeps_fail_count_in_chain():
+    """[Live-round da48f4e8 regression] A tier change inside a hook-forced chain keeps fail_count.
+
+    Resetting it on tier change would let a fail/fix loop that oscillates
+    between tiers run past max_fail_retries without bound.
+    """
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        state = dispatch(transcript, session_hash)
+        if state is None:
+            return False
+        state_path = state_path_for(session_hash)
+        # One failed round so far; now a fix of a different size changes the tier
+        state.update(subagent_pending=False, round_id="", review_agents=[], fail_count=2, tier="quick")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        write_transcript(transcript, [
+            edit_event("/test/file.py", "x" * 600),
+            edit_event("/test/b.py", "y" * 9000),
+            edit_event("/test/c.py", "z" * 9000),
+            edit_event("/test/d.py", "w" * 9000),
+        ])
+        code, stdout, _ = run_hook(transcript, stop_hook_active=True)
+        after = read_state_file(state_path)
+        if after.get("tier") == "quick":
+            return fail(f"setup did not change the tier: {after.get('tier')}")
+        if after.get("fail_count") != 2:
+            return fail(f"tier change within a chain must keep fail_count=2, got {after.get('fail_count')}")
+    print("  PASS: tier change keeps fail_count within a chain")
+    return True
+
+
 LAYERS = [
     ("Regression tests (bugs fixed in 3.0.0)", [
         test_bug1_deep_cross_module_subagent_dispatch,
@@ -834,6 +871,9 @@ LAYERS = [
         test_auto_continue_limit_warns_on_unreviewed_edits,
         test_deep_completed_warns_on_unreviewed_edits,
         test_input_error_log_is_written,
+    ]),
+    ("Live review findings (round da48f4e8)", [
+        test_tier_change_keeps_fail_count_in_chain,
     ]),
 ]
 
