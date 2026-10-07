@@ -7,13 +7,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from stop_design_audit import config
 from stop_design_audit.config import (
-    DEBUG_FILE,
     MAX_DEBUG_LOG_BYTES,
     MAX_METRICS_LINES,
-    METRICS_FILE,
     STALE_FILE_CLEANUP_AGE,
-    STATE_DIR,
 )
 from stop_design_audit.exit_helpers import log
 
@@ -26,145 +24,151 @@ def cleanup_stale_files() -> None:
         for pattern in (
             "stop-hook-state-*.json",
             "review-results-*.json",
+            "review-prompt-*.md",
+            "scavenged-*.marker",
+            "stop-hook-state-*.tmp*",
+            "stop-hook-state-*.corrupt-*",
             "coordinator-instructions-*.json",
-            "subagent-instructions-*.json",
         ):
-            for f in STATE_DIR.glob(pattern):
+            for f in config.STATE_DIR.glob(pattern):
                 try:
                     if now - f.stat().st_mtime > STALE_FILE_CLEANUP_AGE:
                         f.unlink()
                         log(f"Cleaned up stale file: {f.name}")
-                except Exception:
-                    pass
+                except OSError as e:
+                    log(f"WARNING: could not remove stale file {f.name}: {e}")
 
         # Rotate metrics file
-        if METRICS_FILE.exists():
+        if config.METRICS_FILE.exists():
             try:
-                size = METRICS_FILE.stat().st_size
+                size = config.METRICS_FILE.stat().st_size
                 if size > 0:
-                    lines = METRICS_FILE.read_text(encoding="utf-8").splitlines()
+                    lines = config.METRICS_FILE.read_text(encoding="utf-8").splitlines()
                     if len(lines) > MAX_METRICS_LINES:
                         kept = lines[-MAX_METRICS_LINES:]
-                        METRICS_FILE.write_text(
+                        config.METRICS_FILE.write_text(
                             "\n".join(kept) + "\n", encoding="utf-8"
                         )
                         log(f"Rotated metrics: {len(lines)} -> {len(kept)} lines")
-            except Exception:
-                pass
+            except OSError as e:
+                log(f"WARNING: metrics rotation failed: {e}")
 
         # Truncate debug log if too large
-        if DEBUG_FILE.exists():
+        if config.DEBUG_FILE.exists():
             try:
-                if DEBUG_FILE.stat().st_size > MAX_DEBUG_LOG_BYTES:
-                    content = DEBUG_FILE.read_bytes()
+                if config.DEBUG_FILE.stat().st_size > MAX_DEBUG_LOG_BYTES:
+                    content = config.DEBUG_FILE.read_bytes()
                     truncated = content[-(MAX_DEBUG_LOG_BYTES // 2) :]
                     nl = truncated.find(b"\n")
                     if nl != -1:
                         truncated = truncated[nl + 1 :]
-                    DEBUG_FILE.write_bytes(b"[...truncated...]\n" + truncated)
+                    config.DEBUG_FILE.write_bytes(b"[...truncated...]\n" + truncated)
                     log("Truncated debug log")
-            except Exception:
-                pass
+            except OSError as e:
+                log(f"WARNING: debug log truncation failed: {e}")
 
-    except Exception:
-        pass  # Never let cleanup break the hook
+    except OSError as e:
+        log(f"WARNING: stale-file cleanup failed: {e}")
+
+
+def _scavenge_subagent_outcome(
+    session_hash: str, round_id: str, agent_ids: list[str]
+) -> str:
+    """Outcome of an uncollected subagent round, from its results files."""
+    from stop_design_audit.results import ResultsError, read_reviewer_result
+
+    statuses = []
+    for agent_id in agent_ids:
+        try:
+            result = read_reviewer_result(session_hash, round_id, agent_id)
+        except ResultsError:
+            return "invalid_results"
+        if result is None:
+            return "abandoned"
+        statuses.append(result["status"])
+    if not statuses:
+        return "abandoned"
+    return "scavenged_fail" if "fail" in statuses else "scavenged_pass"
+
+
+def _scavenge_marker(session_hash: str, round_id: str) -> Path:
+    return config.STATE_DIR / f"scavenged-{session_hash}-{round_id}.marker"
 
 
 def scavenge_abandoned_reviews(current_session_hash: str) -> None:
-    """Scan state files from OTHER sessions for abandoned pending reviews.
+    """Record metrics for review rounds other sessions left pending.
 
-    When a conversation ends before the hook collects subagent/delegated results,
-    the metric is lost. This function retroactively logs those as "abandoned".
-
-    Called once per hook invocation, after cleanup_stale_files().
-    Only processes state files from sessions other than the current one.
+    READ-ONLY with respect to other sessions' state: their files are never
+    modified (all worktrees share STATE_DIR, so the owner may still be live).
+    A round is considered abandoned once its state is older than
+    STATE_EXPIRY; a marker file prevents scoring it twice. If the owner
+    returns later, it still consumes the round itself.
     """
+    for state_file in config.STATE_DIR.glob("stop-hook-state-*.json"):
+        file_hash = state_file.stem.replace("stop-hook-state-", "")
+        if file_hash == current_session_hash:
+            continue
+        try:
+            _scavenge_one(state_file, file_hash)
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+            # Another session's malformed file must not fail this session;
+            # its owner reports its own corruption.
+            log(f"WARNING: scavenger skipped malformed {state_file.name}: {e}")
+
+
+def _scavenge_one(state_file: Path, file_hash: str) -> None:
+    """Score one other session's abandoned round, if it has one."""
     from stop_design_audit.metrics import log_review_metrics
     from stop_design_audit.results import read_review_results
 
     try:
-        for state_file in STATE_DIR.glob("stop-hook-state-*.json"):
-            try:
-                # Extract session hash from filename
-                # Format: stop-hook-state-{hash}.json
-                fname = state_file.stem  # stop-hook-state-abc123
-                file_hash = fname.replace("stop-hook-state-", "")
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        # Possibly mid-write by its owner; the owner reports corruption.
+        log(f"WARNING: scavenger skipped unreadable {state_file.name}: {e}")
+        return
+    if not isinstance(data, dict):
+        log(f"WARNING: scavenger skipped non-object {state_file.name}")
+        return
+    if not (data.get("subagent_pending") or data.get("delegated_pending")):
+        return
+    round_id = data.get("round_id", "")
+    if not round_id or _scavenge_marker(file_hash, round_id).exists():
+        return
+    try:
+        age = (
+            datetime.now() - datetime.fromisoformat(data["timestamp"])
+        ).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        log(f"WARNING: scavenger skipped {state_file.name}: no valid timestamp")
+        return
+    if age < config.STATE_EXPIRY:
+        return
 
-                # Skip current session
-                if file_hash == current_session_hash:
-                    continue
-
-                content = state_file.read_text(encoding="utf-8")
-                if not content.strip():
-                    continue
-                data = json.loads(content)
-
-                # Only interested in pending reviews
-                is_pending = data.get("subagent_pending") or data.get(
-                    "delegated_pending"
+    outcome = "abandoned"
+    if data.get("subagent_pending"):
+        outcome = _scavenge_subagent_outcome(
+            file_hash, round_id, data.get("review_agents", [])
+        )
+    else:
+        session_id = data.get("session_id", "")
+        if session_id and Path(session_id).exists():
+            results = read_review_results(session_id, file_hash, mode="inline")
+            if results.get("round_id") == round_id:
+                has_failures = any(
+                    isinstance(d, dict) and d.get("status") == "fail"
+                    for d in results.get("agents", {}).values()
                 )
-                if not is_pending:
-                    continue
+                outcome = "scavenged_fail" if has_failures else "scavenged_pass"
 
-                # Check if this state is old enough to be considered abandoned
-                # (at least 10 minutes — gives the background agent time to finish)
-                timestamp_str = data.get("timestamp", "")
-                if timestamp_str:
-                    try:
-                        ts = datetime.fromisoformat(timestamp_str)
-                        age_seconds = (datetime.now() - ts).total_seconds()
-                        if age_seconds < 600:  # 10 minutes
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-
-                round_id = data.get("round_id", "")
-                tier = data.get("tier", "unknown")
-                session_id = data.get("session_id", "")
-                fail_count = data.get("fail_count", 0)
-
-                if not round_id:
-                    continue
-
-                # Try to extract results from the transcript
-                outcome = "abandoned"
-                if session_id and Path(session_id).exists():
-                    results = read_review_results(session_id, file_hash, mode="inline")
-                    if results.get("round_id") == round_id:
-                        # Results were there but never collected!
-                        agents = results.get("agents", {})
-                        has_failures = any(
-                            isinstance(d, dict) and d.get("status") == "fail"
-                            for d in agents.values()
-                        )
-                        outcome = "scavenged_fail" if has_failures else "scavenged_pass"
-                        log(
-                            f"Scavenged results for round {round_id} from {file_hash}: {outcome}"
-                        )
-
-                # Log the metric
-                log_review_metrics(
-                    tier=tier,
-                    diff_chars=0,  # Not available from state file
-                    file_count=0,
-                    agents=[],
-                    outcome=outcome,
-                    fail_count=fail_count,
-                    session_id=file_hash,
-                )
-                log(
-                    f"Scavenged abandoned review: round={round_id}, tier={tier}, outcome={outcome}"
-                )
-
-                # Mark as no longer pending so we don't scavenge again
-                data["subagent_pending"] = False
-                data["delegated_pending"] = False
-                data["completed"] = True
-                state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-            except Exception as e:
-                log(f"Scavenger error on {state_file.name}: {e}")
-                continue
-
-    except Exception:
-        pass  # Never let scavenger break the hook
+    log_review_metrics(
+        tier=data.get("tier", "unknown"),
+        diff_chars=data.get("review_diff_chars", 0),
+        file_count=data.get("review_file_count", 0),
+        agents=data.get("review_agents", []),
+        outcome=outcome,
+        fail_count=data.get("fail_count", 0),
+        session_id=file_hash,
+    )
+    _scavenge_marker(file_hash, round_id).touch()
+    log(f"Scavenged round {round_id} from {file_hash}: {outcome}")

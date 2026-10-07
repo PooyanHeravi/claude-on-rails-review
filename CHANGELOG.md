@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 3.0.0 — 2026-10-07
+
+### Breaking
+- **One reviewer for every tier.** The default review is a single agent, `reviewer` (model from `reviewer_model`, default `opus`), at quick, standard and deep. The tier scales the reviewer's effort, not the agent count. The five built-in agents (`explore_haiku`, `general_haiku`, `bug_hunter`, `integration_checker`, `general_opus`) are removed, and so is the automatic `integration_checker`: cross-module context (changes spanning 2+ top-level directories or 2+ `critical_patterns`) is now passed to the reviewer as extra focus. Custom agents are still possible through `extra_agent_definitions` plus `agent_ids`; each definition needs `subagent_type`, `model` and `checks`, and `agent_ids` may only reference defined agents (`reviewer` or your own).
+- **`subagent_timeout` is removed.** The reviewer runs in the foreground, so there is nothing to time out. The key is now an unknown-key error.
+- **Subagent mode no longer uses a background orchestrator or transcript markers.** The reviewer runs in the FOREGROUND (`run_in_background=false`) and reports through a results file per (session, round, agent) with a strict contract. `results_mode` applies to `agent` and `delegated` modes only.
+- **Runtime files moved to `<hooks_dir>/state/`:** session state, reviewer prompts, results, the debug log and the metrics file. Configuration (`hook-overrides.json`, checklist files) stays in the hooks directory. Projects should git-ignore `.claude/hooks/state/`. Old files in the hooks directory are no longer used.
+- **Configuration is validated and errors are fatal.** Unknown keys, bad types or enum values, invalid JSON, an unknown preset, a missing checklist file, undefined agents and invalid `CLAUDE_HOOK_*` values stop the hook with a visible error instead of being ignored. A 2.x `hook-overrides.json` that lists the removed agents or `subagent_timeout` must be updated.
+- **A missing transcript or a corrupt state file is now an error**, not "no changes".
+
+### Fixed
+- Deep-tier set-serialization crash that silently skipped every deep review.
+- Pending review results were never read after a foreground review (the zero-diff exit ran first); results are now consumed before any diff check.
+- Silent allow on errors: any hook or config error now fails loud (a `systemMessage` to the user plus one block so Claude relays it; on a hook-forced continuation, `stop_hook_active`, it only warns, so it cannot loop).
+- Metrics `session_id` is now the session hash (first 8 characters), so records can be matched to state files.
+- Review no longer switches itself off for the rest of a session: `auto_continue_count`, `fail_count` and `completed` bound consecutive hook-forced continuations and now reset at the first stop of each user turn (`stop_hook_active` false). Previously, three passes disabled review for the rest of the session and marked later edits as seen.
+- The abandoned-review scavenger is read-only on other sessions' state. Previously it cancelled live sessions' pending rounds after 600 s. A round is scored once (marker file) after `state_expiry`.
+- A stale session keeps its pending round, which is then consumed or surfaced as UNREVIEWED instead of dropped.
+- A pending round with no reviewers, or a tier with none configured, is an error, not a vacuous pass. State writes are atomic.
+- Results contract: a `fail` must list issues, and every issue field must be present.
+- Config: `max_*` bounds must be ≥ 1. Agent ids must match `[A-Za-z0-9_-]+` because they become file names. Custom agent field types are validated. The config fingerprint covers custom agents and `review-config.json`.
+- Install and docs: hooks register under `"Stop"` with nested `hooks: [{type: "command", ...}]`, and `timeout` is in seconds (`30`, not `30000`).
+- Loop safety: until the hook input proves `stop_hook_active` is `false`, errors warn without blocking, so they cannot loop. A missing or non-bool `stop_hook_active` is rejected rather than guessed. Tier changes no longer reset `fail_count` within a chain.
+- Guards that mark new edits as seen (cycle completed, auto-continue limit, deep cycle completed) warn that those edits were NOT reviewed instead of allowing silently.
+- Self-heal after one loud failure: a corrupt state file is moved to `.corrupt-<ts>`, and a pending round with no reviewers is discarded. Neither fails on every later stop any more.
+- State save cleans up its temp file and retries Windows sharing violations. The scavenger skips malformed peer state files instead of failing the current session.
+- Config: every integer except `api_diff_threshold` must be ≥ 1. Built-in agent ids cannot be redefined. The fingerprint includes `CLAUDE_HOOK_FORCE_TIER`.
+- install.sh: registers with `python3` (the interpreter it checks for). Its self-test pipes input and matches the current message. A bad settings.json no longer raises a hidden `NameError`. This repo's own `.claude/settings.json` uses the current schema.
+
+### Changed
+- **Checklist:** the reviewer uses a built-in generic checklist (silent failures, correctness, contracts and integration, security, hardcoding, tests), or a project file set with `review_checklist_file` (relative to the hooks directory, or absolute), which REPLACES the built-in one. A missing file is a config error.
+- **New keys:** `reviewer_model`, `fixer_model` (default `sonnet`), `review_checklist_file`. **Removed key:** `subagent_timeout`.
+- **Presets updated:** `minimal` now sets `reviewer_model` to `sonnet` instead of reducing `agent_ids`.
+- **Results contract:** the reviewer writes `state/review-results-<session>-<round>-<agent>.json` with `round_id`, `agent_id`, `status` (`pass`/`fail`) and `issues` (each with `file`, `line`, `severity`, `category`, `description`). The hook rejects anything else without repair; `status` must be `fail` when there is a `critical` issue or two or more `high` issues. Missing or invalid results are re-requested once, then the user sees an "UNREVIEWED" warning.
+- **On fail:** issues are listed and a fix agent (model from `fixer_model`) fixes them. The deep tier honours `deep_auto_fix` (`none` means report only). Fixes made by a subagent are not re-reviewed, because the hook only sees main-session edits.
+- **Provenance:** every metrics record includes the hook `version` and a `config_fingerprint` (SHA-256 over the effective config, the version and the checklist file contents).
+- Loop bounds (`max_auto_continues`, `max_fail_retries`, `max_review_attempts`) and the "continue" text on a pass are unchanged.
+- `agent`, `delegated` and `api` review modes remain available; the documentation focuses on the default `subagent` mode.
+- Documentation rewritten for the single-reviewer flow, state directory, checklist and fail-loud behavior.
+
 ## [2.0.0] - 2026-04-21
 
 ### Added
@@ -151,6 +191,6 @@ Changes to these paths always trigger deep review:
 - `/proto/`
 - `/migrations/`
 
-[Unreleased]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v3.0.0...HEAD
 [2.0.0]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/PooyanHeravi/claude-on-rails-review/releases/tag/v1.0.0

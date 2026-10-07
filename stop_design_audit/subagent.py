@@ -1,523 +1,457 @@
-"""Subagent review mode — minimal context injection via file-based orchestration.
+"""Subagent review mode — foreground reviewer(s), results through files.
 
-The background agent reads full instructions from a file, spawns review
-sub-agents, and writes results to a file. The main session only sees
-~5-line dispatch messages and ~1-line pass/fail summaries.
+Flow per review round:
+  dispatch  → hook writes one prompt file per reviewer and blocks, asking the
+              main session to run the reviewer(s) in the FOREGROUND.
+  reviewer  → reads its prompt file, reviews, writes a results file keyed by
+              (session, round, agent).
+  next stop → hook reads the results files (before any diff checks) and
+              reports pass/fail. Missing or invalid results are re-requested
+              once, then surfaced to the user as UNREVIEWED — never dropped.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
 
+from stop_design_audit import config
+from stop_design_audit.agents import (
+    AGENT_DEFINITIONS,
+    TIER_EFFORT,
+    load_checklist,
+)
 from stop_design_audit.classify import severities_at_or_above
 from stop_design_audit.config import (
-    DEEP_AUTO_FIX,
-    DEEP_AUTO_FIX_ENV,
     MAX_AUTO_CONTINUES,
-    ROUND_ID_LENGTH,
+    MAX_FILES_IN_PROMPT,
+    MAX_REVIEW_ATTEMPTS,
+    MAX_VIOLATION_FILES,
     STATUS_FAIL,
     STATUS_PASS,
-    SUBAGENT_TIMEOUT,
+    effective_deep_auto_fix,
+    get_results_file,
+    get_reviewer_prompt_file,
 )
-from stop_design_audit.delegated import build_coordinator_payload
-from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
+from stop_design_audit.exit_helpers import (
+    allow_stop,
+    block_with_message,
+    log,
+    warn_and_allow,
+)
 from stop_design_audit.flow import (
     ReviewContext,
-    check_circuit_breaker,
     check_completion_guards,
     ensure_round_id,
     get_code_hunks_and_violations,
     get_pending_agents_and_context,
     handle_tier_change,
 )
-from stop_design_audit.instructions import (
-    GIT_FIX_CONSTRAINT,
-    GIT_READONLY_CONSTRAINT,
-    get_review_instructions,
-)
+from stop_design_audit.instructions import GIT_FIX_CONSTRAINT, GIT_READONLY_CONSTRAINT
 from stop_design_audit.metrics import log_review_metrics
-from stop_design_audit.results import read_review_results
+from stop_design_audit.results import ResultsError, read_reviewer_result
 from stop_design_audit.state import ReviewState, update_violation_history
 
 
+def _posix(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/")
+
+
 # =============================================================================
-# Payload & Instructions
+# Reviewer prompt
 # =============================================================================
 
 
-def _get_subagent_instructions_file(session_hash: str) -> Path:
-    """Get session-specific subagent instructions file path."""
-    from stop_design_audit.config import STATE_DIR
-
-    return STATE_DIR / f"subagent-instructions-{session_hash}.json"
-
-
-def _build_background_agent_prompt(payload: dict) -> str:
-    """Build the full orchestration prompt stored in the payload file.
-
-    This can be long because it lives in the file, not in the main session.
-    """
-    pending = payload.get("pending_agents", [])
-    agent_defs = payload.get("agent_definitions", {})
-    round_id = payload.get("round_id", "")
-    tier = payload.get("tier", "")
-    deep_auto_fix = payload.get("deep_auto_fix", "none")
-
-    agent_lines = []
-    for i, agent_id in enumerate(pending, 1):
-        defn = agent_defs.get(agent_id, {})
-        stype = defn.get("subagent_type", "general-purpose")
-        model = defn.get("model", "haiku")
-        effort = defn.get("effort", "")
-        checks = defn.get("checks", "general code review")
-        extra = defn.get("resolved_extra_checks", [])
-        extra_str = f" ALSO: {'; '.join(extra)}" if extra else ""
-        effort_str = ""
-        if effort == "max":
-            effort_str = (
-                "\n   EFFORT=MAX: Be exhaustive. Trace every cross-module dependency. "
-                "Read every changed file fully. Verify all contracts and signatures. "
-                "No shortcuts — check edge cases, ordering, and side effects."
-            )
-        elif effort:
-            effort_str = f"\n   EFFORT={effort.upper()}: Be thorough in your analysis."
-        agent_lines.append(
-            f"{i}. Agent ID: {agent_id}\n"
-            f"   subagent_type='{stype}', model='{model}'\n"
-            f"   Check: {checks}{extra_str}{effort_str}"
-        )
-    agents_block = "\n".join(agent_lines)
-
-    fix_section = ""
-    if deep_auto_fix != "none":
-        qualifying = ", ".join(severities_at_or_above(deep_auto_fix))
-        fix_section = (
-            f"\n## Issue Handling\n"
-            f"If any agent fails, spawn ONE general-purpose subagent (model='sonnet') "
-            f"to fix issues at severity [{qualifying}]. "
-            f"After fixes, set outcome to 'auto_fixed'.\n"
-            f"{GIT_FIX_CONSTRAINT}\n"
-        )
-    elif tier == "deep":
-        # Plan agent only for deep tier with auto-fix disabled
-        fix_section = (
-            "\n## Issue Handling\n"
-            "If any agent fails, spawn ONE Plan subagent (subagent_type='Plan') "
-            "to create a prioritized remediation plan from the issues found. "
-            "Include the plan text in the results under 'plan'. "
-            "Set outcome to 'plan_created'.\n"
-        )
-
+def _results_schema_example(round_id: str, agent_id: str) -> str:
     return (
-        f"You are a code review orchestrator.\n\n"
-        f"## Instructions\n"
-        f"1. The file_list, code_hunks, and file_contexts are in this JSON payload.\n"
-        f"2. Spawn {len(pending)} review agent(s) IN PARALLEL using the Agent tool:\n\n"
-        f"{agents_block}\n\n"
-        f"3. Pass each agent: its checks, the file_list, code_hunks from this payload.\n"
-        f"4. Fail criteria: any critical issue OR 2+ high issues means status='fail'.\n"
-        f"5. Collect all results.\n"
-        f"{fix_section}\n"
-        f"## Output\n"
-        f"Return the aggregated results JSON as your final output. Use this exact format:\n"
-        f'{{"round_id": "{round_id}", "agents": {{"<agent_id>": '
-        f'{{"status": "pass"|"fail", "issues": [...]}}}}, '
-        f'"outcome": "pass"|"fail"|"auto_fixed"|"plan_created"}}\n\n'
-        f"Return ONLY the JSON object — no markdown fences, no commentary."
-        f"{GIT_READONLY_CONSTRAINT}"
+        "{\n"
+        f'  "round_id": "{round_id}",\n'
+        f'  "agent_id": "{agent_id}",\n'
+        '  "status": "pass" | "fail",\n'
+        '  "issues": [\n'
+        "    {\n"
+        '      "file": "path/to/file.py",\n'
+        '      "line": 42,\n'
+        '      "severity": "critical" | "high" | "medium" | "low",\n'
+        '      "category": "short-kebab-slug",\n'
+        '      "description": "what is wrong and the concrete failure it causes"\n'
+        "    }\n"
+        "  ]\n"
+        "}"
     )
 
 
-def _build_subagent_payload(
-    session_hash: str,
-    **coordinator_kwargs,
-) -> dict:
-    """Build payload for background agent. Extends coordinator payload."""
-    payload = build_coordinator_payload(**coordinator_kwargs)
+def build_reviewer_prompt(
+    *,
+    agent_id: str,
+    state: ReviewState,
+    ctx: ReviewContext,
+    integration_context: dict | None,
+    code_hunks: dict[str, str],
+    import_violations: list[str],
+    results_path: Path,
+) -> str:
+    """Build the markdown prompt one reviewer reads from its prompt file."""
+    defn = AGENT_DEFINITIONS[agent_id]
+    round_id = state.round_id
 
-    effective_auto_fix = os.environ.get(DEEP_AUTO_FIX_ENV, "").lower() or DEEP_AUTO_FIX
+    if agent_id == "reviewer":
+        checklist = load_checklist()
+    else:
+        checklist = defn["checks"]
 
-    payload["session_hash"] = session_hash
-    payload["deep_auto_fix"] = effective_auto_fix
-    payload["autonomous_deep_failure"] = True
-    payload["background_agent_instructions"] = _build_background_agent_prompt(payload)
+    focus: list[str] = []
+    context_checks = defn.get("context_checks", {})
+    focus.extend(
+        context_checks[c] for c in sorted(ctx.file_contexts) if c in context_checks
+    )
+    if integration_context:
+        if len(integration_context["dirs"]) >= 2:
+            focus.append(
+                "Cross-module change spanning: "
+                + ", ".join(integration_context["dirs"])
+                + " — check callers and contracts across these boundaries."
+            )
+        if len(integration_context["patterns"]) >= 2:
+            focus.append(
+                "Critical paths touched: " + ", ".join(integration_context["patterns"])
+            )
+    focus.extend(f"Module-boundary violation detected: {v}" for v in import_violations)
+    problem_files = [
+        f for f in sorted(ctx.all_modified_files) if f in state.violation_history
+    ]
+    for f in problem_files[:MAX_VIOLATION_FILES]:
+        cats = state.violation_history[f]
+        focus.append(
+            f"{f} had {sum(cats.values())} earlier finding(s) this session "
+            f"(most common: {max(cats.items(), key=lambda x: x[1])[0]})"
+        )
+    focus_section = "\n".join(f"- {line}" for line in focus) or "- (none)"
 
-    return payload
+    files = sorted(ctx.all_modified_files)
+    file_lines = "\n".join(f"- {f}" for f in files[:MAX_FILES_IN_PROMPT])
+    if len(files) > MAX_FILES_IN_PROMPT:
+        file_lines += f"\n- ...and {len(files) - MAX_FILES_IN_PROMPT} more"
 
+    hunk_section = (
+        "\n\n".join(
+            f"### {path}\n```\n{hunk}\n```" for path, hunk in sorted(code_hunks.items())
+        )
+        or "(no previews available — read the files)"
+    )
 
-def _write_subagent_instructions(session_hash: str, payload: dict) -> Path:
-    """Write subagent payload to JSON file. Returns the absolute file path."""
-    instructions_file = _get_subagent_instructions_file(session_hash)
-    instructions_file.write_text(json.dumps(payload, indent=2))
-    log(f"Wrote subagent instructions to {instructions_file.name}")
-    return instructions_file
+    return f"""# Design audit — round {round_id} ({ctx.tier} tier)
+
+You are a senior code reviewer. Review the changes below against the checklist.
+The previews are pointers only — read each changed file with Read/Grep/Glob.
+
+## Effort
+{TIER_EFFORT[ctx.tier]}
+
+## Checklist
+{checklist.strip()}
+
+## Extra focus for this change
+{focus_section}
+
+## Changed files ({len(files)})
+{file_lines}
+
+## Change previews (from the session transcript; may be truncated)
+{hunk_section}
+
+## Rules
+- Report real defects in the changed code, or in code the change breaks. No style nits.
+- Each issue needs a concrete failure: what input/state leads to what wrong outcome.
+- status = "fail" if there is any critical issue or 2+ high issues; otherwise "pass"
+  (still list the lower-severity issues).
+- Do not edit any file other than the results file below.{GIT_READONLY_CONSTRAINT}
+
+## Output — REQUIRED
+Write exactly this JSON shape to `{_posix(results_path)}` with the Write tool:
+
+{_results_schema_example(round_id, agent_id)}
+
+Then reply with one line: `round {round_id}: <status>, <N> issue(s)`.
+"""
 
 
 # =============================================================================
-# Block Messages (minimal)
+# Block messages
 # =============================================================================
+
+
+def _spawn_instructions(state: ReviewState, agent_ids: list[str]) -> str:
+    lines = []
+    for agent_id in agent_ids:
+        defn = AGENT_DEFINITIONS[agent_id]
+        prompt_path = get_reviewer_prompt_file(
+            state.session_hash, state.round_id, agent_id
+        )
+        lines.append(
+            f"  - subagent_type='{defn['subagent_type']}', model='{defn['model']}', "
+            f"description='design audit {state.round_id} ({agent_id})', "
+            f"prompt='Read {_posix(prompt_path)} and follow it exactly.'"
+        )
+    return (
+        f"In ONE message, make {len(agent_ids)} Agent call(s) with run_in_background=false:\n"
+        + "\n".join(lines)
+        + "\nWhen the review returns, end your turn. The stop hook reads the results "
+        "file(s) and reports the outcome — do not act on the review yourself."
+    )
 
 
 def _get_dispatch_message(
-    tier: str,
-    round_id: str,
-    instructions_file: Path,
-    pending_agent_count: int,
-    diff_size: int,
-    file_count: int,
-    auto_continue_count: int,
+    state: ReviewState, ctx: ReviewContext, agent_ids: list[str]
 ) -> str:
-    """Build the minimal block message for subagent dispatch (~4 lines)."""
-    abs_path = str(instructions_file.resolve()).replace("\\", "/")
     return (
-        f"REVIEW: +{diff_size} chars, {file_count} files [{tier.upper()}] "
-        f"[Round: {round_id}]\n"
-        f"Spawn 1 background agent (run_in_background=true): "
-        f'"Read instructions from {abs_path}. '
-        f"Execute all {pending_agent_count} review agent(s). "
-        f'Handle failures per instructions. Return the results JSON."\n'
-        f"[Auto-continue {auto_continue_count + 1} of {MAX_AUTO_CONTINUES}] "
-        f"Continue with implementation."
-        f"{GIT_READONLY_CONSTRAINT}"
+        f"DESIGN AUDIT [{ctx.tier.upper()}] round {state.round_id}: "
+        f"+{abs(ctx.incremental_diff)} chars across {len(ctx.all_modified_files)} file(s).\n"
+        f"Run the review now, before anything else.\n"
+        f"{_spawn_instructions(state, agent_ids)}"
     )
 
 
-def _get_pending_message(round_id: str) -> str:
-    return f"Background review in progress (round {round_id}). Continue."
-
-
-def _get_passed_message(auto_continue_count: int) -> str:
-    if auto_continue_count < MAX_AUTO_CONTINUES - 1:
-        return (
-            f"All reviews passed. "
-            f"[Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] Continue."
+def _get_passed_message(auto_continue_count: int, notes: list[dict]) -> str:
+    msg = (
+        f"Design audit passed. [Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] "
+        + (
+            "Continue."
+            if auto_continue_count < MAX_AUTO_CONTINUES - 1
+            else "Continue or identify next steps."
         )
-    return (
-        f"All reviews passed. "
-        f"[Auto-continue {auto_continue_count} of {MAX_AUTO_CONTINUES}] "
-        f"Continue or identify next steps."
     )
-
-
-def _get_failure_message(
-    failed_count: int, issue_count: int, plan_included: bool
-) -> str:
-    if plan_included:
-        return (
-            f"Review: {failed_count} agent(s) found {issue_count} issue(s). "
-            f"Remediation plan in results file. Review and proceed with fixes."
+    if notes:
+        msg += (
+            f"\nNon-blocking findings ({len(notes)}) — mention them to the user:\n"
+            + _format_issues(notes)
         )
-    return (
-        f"Review: {failed_count} agent(s) found {issue_count} issue(s). "
-        f"Auto-fix agent handled qualifying issues. Resume prior task."
+    return msg
+
+
+def _format_issues(issues: list[dict]) -> str:
+    return "\n".join(
+        f"- [{i['severity'].upper()}] {i['file']}:{i['line'] if i['line'] is not None else '?'} "
+        f"({i['found_by']}) {i['description']}"
+        for i in issues
     )
 
 
 # =============================================================================
-# Result Processing (minimal output)
+# Result processing
 # =============================================================================
 
 
-def _process_subagent_results(
-    state: ReviewState,
-    ctx: ReviewContext,
-    results: dict,
-) -> bool:
-    """Process results from subagent. Emits 1-2 line messages.
+def _collect_issues(results: dict[str, dict]) -> list[dict]:
+    issues = []
+    for agent_id, data in results.items():
+        for issue in data["issues"]:
+            issues.append({**issue, "found_by": agent_id})
+    order = {s: n for n, s in enumerate(config.SEVERITY_ORDER)}
+    return sorted(issues, key=lambda i: order[i["severity"]])
 
-    Returns True if results were processed, False if no matching results.
-    """
-    if results.get("round_id") != state.round_id:
-        return False
 
-    log(f"Found subagent results for round {state.round_id}")
-    agents_results = results.get("agents", {})
-    outcome = results.get("outcome", "")
+def _log_round_metrics(state: ReviewState, outcome: str) -> None:
+    log_review_metrics(
+        tier=state.tier,
+        diff_chars=state.review_diff_chars,
+        file_count=state.review_file_count,
+        agents=state.review_agents,
+        outcome=outcome,
+        fail_count=state.fail_count,
+        session_id=state.session_hash,
+    )
 
-    # Update passed_agents
-    for agent_id, data in agents_results.items():
-        if isinstance(data, dict) and data.get("status") == STATUS_PASS:
-            if agent_id not in state.passed_agents:
-                state.passed_agents.append(agent_id)
-                log(f"  Agent {agent_id}: PASSED")
 
-    failed_agents = [
-        aid
-        for aid, data in agents_results.items()
-        if isinstance(data, dict) and data.get("status") == STATUS_FAIL
-    ]
+def _finish_round(state: ReviewState) -> None:
+    """Clear per-round fields once a round's results are consumed."""
+    state.subagent_pending = False
+    state.round_id = ""
+    state.passed_agents = []
+    state.review_agents = []
+    state.review_attempts = 0
 
-    required, _, _ = get_pending_agents_and_context(state, ctx)
 
-    if failed_agents:
-        state.fail_count += len(failed_agents)
-        log(
-            f"  {len(failed_agents)} agent(s) failed, fail_count now {state.fail_count}"
-        )
-        state.violation_history = update_violation_history(
-            state.violation_history, results
-        )
+def _handle_pass(state: ReviewState, results: dict[str, dict]) -> NoReturn:
+    notes = _collect_issues(results)
+    _log_round_metrics(state, STATUS_PASS)
+    _finish_round(state)
+    state.fail_count = 0
+    state.auto_continue_count += 1
+    log(f"Design audit passed; auto_continue_count now {state.auto_continue_count}")
 
-        log_review_metrics(
-            tier=ctx.tier,
-            diff_chars=abs(ctx.incremental_diff),
-            file_count=len(ctx.incremental_files),
-            agents=required,
-            outcome=STATUS_FAIL,
-            fail_count=state.fail_count,
-            session_id=state.session_id,
-        )
-
-        if outcome in (
-            "auto_fixed",
-            "plan_created",
-            "deep_failure_with_plan",
-            "deep_failure_auto_fixed",
-        ):
-            total_issues = sum(
-                len(d.get("issues", []))
-                for d in agents_results.values()
-                if isinstance(d, dict)
-            )
-            log(f"Failure handled by background agent: {outcome}")
-            state.last_total_diff = ctx.current_total_diff
-            state.last_files_seen = ctx.all_files_seen
-            state.tier = ctx.tier
-            state.completed = True
-            state.save()
-            plan_included = outcome in ("plan_created", "deep_failure_with_plan")
-            block_with_message(
-                _get_failure_message(
-                    len(failed_agents),
-                    total_issues,
-                    plan_included=plan_included,
-                )
-            )
-        # Non-deep failure: fall through to re-dispatch
-        return True
-
-    # No failures — check if all passed
-    all_passed = all(a in state.passed_agents for a in required)
-    if all_passed:
-        log_review_metrics(
-            tier=ctx.tier,
-            diff_chars=abs(ctx.incremental_diff),
-            file_count=len(ctx.incremental_files),
-            agents=required,
-            outcome=STATUS_PASS,
-            fail_count=state.fail_count,
-            session_id=state.session_id,
-        )
-        state.auto_continue_count += 1
-        log(f"All agents passed! auto_continue_count now {state.auto_continue_count}")
-
-        if state.auto_continue_count >= MAX_AUTO_CONTINUES:
-            log("Max auto continues reached (subagent)")
-            state.last_total_diff = ctx.current_total_diff
-            state.last_files_seen = ctx.all_files_seen
-            state.tier = ctx.tier
-            state.fail_count = 0
-            state.round_id = ""
-            state.passed_agents = []
-            state.completed = True
-            state.save()
-            allow_stop("All passed, max auto-continues (subagent)")
-
-        state.last_total_diff = ctx.current_total_diff
-        state.last_files_seen = ctx.all_files_seen
-        state.tier = ctx.tier
-        state.fail_count = 0
-        state.round_id = uuid.uuid4().hex[:ROUND_ID_LENGTH]
-        state.passed_agents = []
-        state.completed = False
+    if state.auto_continue_count >= MAX_AUTO_CONTINUES:
+        state.completed = True
         state.save()
-        block_with_message(_get_passed_message(state.auto_continue_count))
+        if notes:
+            warn_and_allow(
+                f"design audit passed with {len(notes)} non-blocking finding(s):\n"
+                + _format_issues(notes)
+            )
+        allow_stop("All passed, max auto-continues (subagent)")
 
-    return True
+    state.save()
+    block_with_message(_get_passed_message(state.auto_continue_count, notes))
 
 
-# =============================================================================
-# Mode Dispatch
-# =============================================================================
-
-
-def handle_subagent_pending(
-    state: ReviewState, ctx: ReviewContext, old_tier: str, old_round_id: str
-) -> None:
-    """Handle the case when a subagent is pending."""
-    log(f"Subagent pending (blocked_once={state.subagent_blocked_once})")
-
-    # Check if tier changed — abandon pending
-    tier_changed = old_tier and old_tier != ctx.tier
-    if tier_changed:
-        log(
-            f"Tier changed ({old_tier} -> {ctx.tier}) while subagent pending - resetting"
-        )
-        state.subagent_pending = False
-        state.subagent_blocked_once = False
-        return
-
-    # Background agent returns results JSON in transcript (inline mode)
-    results = read_review_results(
-        ctx.transcript_path, state.session_hash, mode="inline"
+def _handle_fail(state: ReviewState, results: dict[str, dict]) -> NoReturn:
+    failed = [a for a, d in results.items() if d["status"] == STATUS_FAIL]
+    issues = _collect_issues(results)
+    state.fail_count += len(failed)
+    state.violation_history = update_violation_history(
+        state.violation_history, {"agents": results}
     )
+    _log_round_metrics(state, STATUS_FAIL)
+    round_id = state.round_id
+    tier = state.tier
+    _finish_round(state)
 
-    if results.get("round_id") == state.round_id:
-        log(f"Found subagent results for round {state.round_id}")
-        state.subagent_pending = False
-        state.subagent_blocked_once = False
-        _process_subagent_results(state, ctx, results)
-        return
+    threshold = effective_deep_auto_fix() if tier == "deep" else "all"
+    qualifying = set(severities_at_or_above(threshold))
+    fixable = [i for i in issues if i["severity"] in qualifying]
+    report_only = [i for i in issues if i["severity"] not in qualifying]
+    log(f"Design audit failed: {len(fixable)} fixable, {len(report_only)} report-only")
 
-    # No results yet — check timeout
-    timed_out = False
-    if state.subagent_dispatch_time:
+    header = (
+        f"DESIGN AUDIT FAILED (round {round_id}, {tier}): "
+        f"{len(issues)} issue(s) from {len(failed)} reviewer(s)."
+    )
+    if not fixable:
+        # Nothing qualifies for auto-fix — report and stop.
+        state.completed = True
+        state.save()
+        block_with_message(
+            f"{header}\n{_format_issues(issues)}\n\n"
+            "Report these findings to the user and end your turn. "
+            "Do not fix them unless the user asks."
+        )
+
+    message = (
+        f"{header}\nFix these {len(fixable)} issue(s) by spawning ONE Agent "
+        f"(subagent_type='general-purpose', model='{config.FIXER_MODEL}', "
+        f"run_in_background=false) and passing it this list:\n{_format_issues(fixable)}\n"
+        f"{GIT_FIX_CONSTRAINT}\n"
+    )
+    if report_only:
+        message += (
+            f"\nReport to the user without fixing ({len(report_only)}):\n"
+            f"{_format_issues(report_only)}\n"
+        )
+    # Edits made by a subagent are not in the main transcript, so this hook
+    # cannot re-review the fix; say so rather than imply it will.
+    message += (
+        "\nAfter the fix agent returns, tell the user what was fixed and end your turn. "
+        "Note for the user: subagent fixes are not re-reviewed by this hook."
+    )
+    state.save()
+    block_with_message(message)
+
+
+def handle_subagent_pending(state: ReviewState) -> NoReturn:
+    """Consume the results of the pending round. Always exits."""
+    round_id = state.round_id
+    log(f"Subagent round {round_id} pending (attempt {state.review_attempts})")
+    if not state.review_agents:
+        _finish_round(state)
+        state.save()  # discard the broken round so the next stop is clean
+        raise ValueError(
+            f"pending round {round_id!r} has no reviewers in state; discarded, "
+            "its changes were NOT reviewed"
+        )
+
+    results: dict[str, dict] = {}
+    problems: list[str] = []
+    retry_agents: list[str] = []
+    for agent_id in state.review_agents:
         try:
-            dispatch_dt = datetime.fromisoformat(state.subagent_dispatch_time)
-            elapsed = (datetime.now() - dispatch_dt).total_seconds()
-            if elapsed > SUBAGENT_TIMEOUT:
-                log(f"Subagent timed out ({elapsed:.0f}s > {SUBAGENT_TIMEOUT}s)")
-                timed_out = True
-        except (ValueError, TypeError):
-            log("Invalid subagent_dispatch_time, treating as timed out")
-            timed_out = True
+            result = read_reviewer_result(state.session_hash, round_id, agent_id)
+        except ResultsError as e:
+            problems.append(str(e))
+            retry_agents.append(agent_id)
+            continue
+        if result is None:
+            problems.append(f"{agent_id}: no results file")
+            retry_agents.append(agent_id)
+        else:
+            results[agent_id] = result
 
-    if timed_out:
-        log("Falling back to inline agent mode due to subagent timeout")
-        state.subagent_pending = False
-        state.subagent_blocked_once = False
-        state.last_total_diff = ctx.current_total_diff
-        state.last_files_seen = ctx.all_files_seen
-        state.tier = ctx.tier
+    if not retry_agents:
+        if any(d["status"] == STATUS_FAIL for d in results.values()):
+            _handle_fail(state, results)
+        _handle_pass(state, results)
+
+    detail = "; ".join(problems)
+    if state.review_attempts < MAX_REVIEW_ATTEMPTS:
+        state.review_attempts += 1
         state.save()
-
-        # Fall back to full inline agent instructions
-        code_hunks, import_violations = get_code_hunks_and_violations(ctx)
-        _, pending_agents, integration_context = get_pending_agents_and_context(
-            state, ctx
+        log(f"Round {round_id} incomplete ({detail}) — re-requesting")
+        block_with_message(
+            f"DESIGN AUDIT round {round_id} has no valid results yet: {detail}.\n"
+            f"{_spawn_instructions(state, retry_agents)}"
         )
-        review_instructions = get_review_instructions(
-            tier=ctx.tier,
-            diff_size=abs(ctx.incremental_diff),
-            total_file_count=len(ctx.all_modified_files),
-            new_file_count=len(ctx.incremental_files),
-            file_list=ctx.file_list,
-            pending_agents=pending_agents,
-            passed_agents=state.passed_agents,
-            round_id=state.round_id,
-            auto_continue_count=state.auto_continue_count,
-            fail_count=state.fail_count,
-            file_contexts=ctx.file_contexts,
-            session_hash=state.session_hash,
-            integration_context=integration_context,
-            files=list(ctx.all_modified_files),
-            code_hunks=code_hunks,
-            violation_history=state.violation_history,
-            import_violations=import_violations,
-        )
-        block_with_message(review_instructions)
 
-    elif state.subagent_blocked_once:
-        log("Already blocked once while waiting for subagent — allowing stop")
-        allow_stop("Subagent pending, blocked once already")
-    else:
-        log("Blocking once while waiting for subagent")
-        state.subagent_blocked_once = True
-        state.last_total_diff = ctx.current_total_diff
-        state.last_files_seen = ctx.all_files_seen
-        state.tier = ctx.tier
-        state.save()
-        block_with_message(_get_pending_message(state.round_id))
+    outcome = (
+        "invalid_results"
+        if any("no results file" not in p for p in problems)
+        else "abandoned"
+    )
+    _log_round_metrics(state, outcome)
+    _finish_round(state)
+    state.save()
+    warn_and_allow(
+        f"design audit round {round_id} produced no valid results after "
+        f"{MAX_REVIEW_ATTEMPTS} attempt(s) ({detail}). These changes are UNREVIEWED."
+    )
 
 
-def run_subagent_mode(
-    state: ReviewState, ctx: ReviewContext, old_tier: str, old_round_id: str
-) -> None:
-    """Subagent mode: spawn ONE background agent that handles everything."""
+# =============================================================================
+# Dispatch
+# =============================================================================
+
+
+def run_subagent_mode(state: ReviewState, ctx: ReviewContext) -> NoReturn:
+    """Dispatch a new review round. Always exits."""
     check_completion_guards(state, ctx)
-
-    # Handle pending subagent
-    if state.subagent_pending:
-        handle_subagent_pending(state, ctx, old_tier, old_round_id)
-
     handle_tier_change(state, ctx.tier)
     ensure_round_id(state)
 
-    # Check pending agents
+    # Every round reviews with all required agents: passes don't carry over.
+    state.passed_agents = []
     _, pending_agents, integration_context = get_pending_agents_and_context(state, ctx)
     if not pending_agents:
-        # All passed already — use minimal message
-        state.auto_continue_count += 1
-        if state.auto_continue_count >= MAX_AUTO_CONTINUES:
-            state.last_total_diff = ctx.current_total_diff
-            state.last_files_seen = ctx.all_files_seen
-            state.tier = ctx.tier
-            state.completed = True
-            state.save()
-            allow_stop("All passed, max auto-continues (subagent)")
-        state.last_total_diff = ctx.current_total_diff
-        state.last_files_seen = ctx.all_files_seen
-        state.tier = ctx.tier
-        state.save()
-        block_with_message(_get_passed_message(state.auto_continue_count))
-
-    # Circuit breaker
-    check_circuit_breaker(state, ctx, old_round_id)
-
-    # Track review attempts
-    if state.round_id == old_round_id:
-        state.review_attempts += 1
-    else:
-        state.review_attempts = 1
-
-    # Build payload and dispatch
-    log(
-        f"Dispatching subagent {ctx.tier} review, round {state.round_id}, pending: {pending_agents} (attempt {state.review_attempts})"
-    )
-
+        raise ValueError(f"no reviewers configured for tier {ctx.tier!r}")
     code_hunks, import_violations = get_code_hunks_and_violations(ctx)
 
-    payload = _build_subagent_payload(
-        session_hash=state.session_hash,
-        tier=ctx.tier,
-        diff_size=abs(ctx.incremental_diff),
-        total_file_count=len(ctx.all_modified_files),
-        new_file_count=len(ctx.incremental_files),
-        file_list=ctx.file_list,
-        pending_agents=pending_agents,
-        passed_agents=state.passed_agents,
-        round_id=state.round_id,
-        auto_continue_count=state.auto_continue_count,
-        fail_count=state.fail_count,
-        file_contexts=ctx.file_contexts,
-        integration_context=integration_context,
-        files=list(ctx.all_modified_files),
-        code_hunks=code_hunks,
-        violation_history=state.violation_history,
-        import_violations=import_violations,
-    )
-    instructions_file = _write_subagent_instructions(state.session_hash, payload)
+    for agent_id in pending_agents:
+        results_path = get_results_file(state.session_hash, state.round_id, agent_id)
+        prompt = build_reviewer_prompt(
+            agent_id=agent_id,
+            state=state,
+            ctx=ctx,
+            integration_context=integration_context,
+            code_hunks=code_hunks,
+            import_violations=import_violations,
+            results_path=results_path,
+        )
+        prompt_path = get_reviewer_prompt_file(
+            state.session_hash, state.round_id, agent_id
+        )
+        prompt_path.write_text(prompt, encoding="utf-8")
+        log(f"Wrote reviewer prompt {prompt_path.name}")
 
+    log(
+        f"Dispatching {ctx.tier} review, round {state.round_id}, agents: {pending_agents}"
+    )
     state.last_total_diff = ctx.current_total_diff
     state.last_files_seen = ctx.all_files_seen
     state.tier = ctx.tier
     state.subagent_pending = True
     state.subagent_dispatch_time = datetime.now().isoformat()
-    state.subagent_blocked_once = False
+    state.review_agents = list(pending_agents)
+    state.review_attempts = 1
+    state.review_diff_chars = abs(ctx.incremental_diff)
+    state.review_file_count = len(ctx.incremental_files)
     state.save()
 
-    block_with_message(
-        _get_dispatch_message(
-            tier=ctx.tier,
-            round_id=state.round_id,
-            instructions_file=instructions_file,
-            pending_agent_count=len(pending_agents),
-            diff_size=abs(ctx.incremental_diff),
-            file_count=len(ctx.all_modified_files),
-            auto_continue_count=state.auto_continue_count,
-        )
-    )
+    block_with_message(_get_dispatch_message(state, ctx, pending_agents))

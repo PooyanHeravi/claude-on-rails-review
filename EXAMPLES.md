@@ -1,6 +1,8 @@
 # Configuration Examples
 
-Real-world configuration examples for different project types and workflows.
+Real-world `hook-overrides.json` examples for different project types and workflows. All examples are valid for 3.0.0: they use one `reviewer` per tier, with the checklist, models and thresholds as the main controls.
+
+Put overrides in `.claude/hooks/hook-overrides.json`, and a checklist file next to it in `.claude/hooks/`. Add `.claude/hooks/state/` to `.gitignore`.
 
 ## Table of Contents
 
@@ -11,6 +13,8 @@ Real-world configuration examples for different project types and workflows.
 - [Production System](#production-system)
 - [Open Source Project](#open-source-project)
 - [Monorepo](#monorepo)
+- [Team Size](#team-size)
+- [Tips](#tips)
 
 ## Microservices Project
 
@@ -22,9 +26,6 @@ Multiple services with strict boundaries, gRPC communication, shared core librar
 project/
 ├── api/           # REST API gateway
 ├── services/      # gRPC microservices
-│   ├── auth/
-│   ├── users/
-│   └── orders/
 ├── core/          # Shared models
 ├── proto/         # Protocol buffers
 └── frontend/      # Web UI
@@ -36,44 +37,40 @@ project/
 ```json
 {
   "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 30000
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python .claude/hooks/stop-design-audit.py",
+        "timeout": 30
+      }]
     }]
   }
 }
 ```
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# Strict thresholds for service boundaries
-TIER_THRESHOLDS = {
-    "skip": 300,
-    "quick": 2000,
-    "standard": 10000,
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "balanced",
+  "review_checklist_file": "review-checklist.md",
+  "tier_thresholds": {"skip": 300, "quick": 2000, "standard": 10000},
+  "tier_file_limits": {"skip": 1, "quick": 2, "standard": 5},
+  "+critical_patterns": ["/api/", "/services/", "/proto/", "_service.py", "/models/"],
+  "max_auto_continues": 2,
+  "max_fail_retries": 2
 }
+```
 
-TIER_FILE_LIMITS = {
-    "skip": 1,
-    "quick": 2,
-    "standard": 5,
-}
+Changes touching two or more of the critical patterns (or two top-level directories) make the reviewer check callers and contracts across those boundaries.
 
-# Critical patterns - always deep review
-CRITICAL_PATTERNS = [
-    "/api/",
-    "/services/",
-    "/proto/",
-    "_service.py",
-    "/models/",
-]
-
-# Conservative auto-continue
-MAX_AUTO_CONTINUES = 2
-MAX_FAIL_RETRIES = 2
+**.claude/hooks/review-checklist.md** (replaces the built-in checklist, so it repeats the generic items):
+```markdown
+1. Silent failures - swallowed exceptions, defaults returned on failure.
+2. Correctness - null access, race conditions, resource leaks, edge cases.
+3. Proto compatibility - field numbering, enum values, no breaking changes without a version bump.
+4. Service boundaries - services talk through gRPC interfaces, never import each other.
+5. Every RPC validates its request and maps errors to status codes.
+6. Bug fixes include a regression test.
 ```
 
 **.claude/review-config.json:**
@@ -81,22 +78,18 @@ MAX_FAIL_RETRIES = 2
 {
   "module_boundaries": {
     "api": {
-      "allowed_imports": ["core"],
       "forbidden_imports": ["services", "frontend"],
       "communication": "Must use gRPC client to communicate with services"
     },
     "services": {
-      "allowed_imports": ["core"],
       "forbidden_imports": ["api", "frontend"],
       "communication": "Services communicate via gRPC only"
     },
     "frontend": {
-      "allowed_imports": [],
       "forbidden_imports": ["api", "services", "core"],
       "communication": "Must use REST API only, no direct imports"
     },
     "core": {
-      "allowed_imports": [],
       "forbidden_imports": ["api", "services", "frontend"],
       "communication": "Core is a shared library with no dependencies"
     }
@@ -104,324 +97,161 @@ MAX_FAIL_RETRIES = 2
 }
 ```
 
-**Custom agent for proto files:**
-```python
-AGENT_DEFINITIONS["proto_checker"] = {
-    "subagent_type": "general-purpose",
-    "model": "sonnet",
-    "checks": "protobuf field numbering, breaking changes, enum values",
-    "context_checks": {
-        "proto": "Check backward compatibility, field deprecation"
-    }
-}
-
-AGENT_IDS["deep"] = [
-    "explore_haiku",
-    "general_haiku",
-    "bug_hunter",
-    "general_sonnet",
-    "proto_checker"  # Added
-]
-```
-
 ## Frontend Application
 
 ### Overview
-React application with API calls, state management, no backend code.
-
-### Project Structure
-```
-frontend/
-├── src/
-│   ├── components/
-│   ├── pages/
-│   ├── hooks/
-│   ├── utils/
-│   └── api/
-├── tests/
-└── public/
-```
+React application with API calls and state management, no backend code.
 
 ### Configuration
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# Relaxed thresholds for frontend iteration
-TIER_THRESHOLDS = {
-    "skip": 1000,
-    "quick": 5000,
-    "standard": 20000,
-}
-
-# More auto-continues for rapid UI development
-MAX_AUTO_CONTINUES = 5
-
-# Frontend-specific critical patterns
-CRITICAL_PATTERNS = [
-    "/api/",
-    "/hooks/",
-    "/context/",
-    "Provider.tsx",
-]
-
-# Exclude UI snapshot tests
-EXCLUDED_PATHS = [
-    "/tests/fixtures/",
-    "/__snapshots__/",
-    "/storybook-static/",
-    "/coverage/",
-]
-
-# Frontend-focused agents
-AGENT_IDS = {
-    "quick": ["explore_haiku"],
-    "standard": ["explore_haiku", "frontend_specialist"],
-    "deep": ["explore_haiku", "frontend_specialist", "bug_hunter"],
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "relaxed",
+  "reviewer_model": "sonnet",
+  "+critical_patterns": ["/api/", "/hooks/", "/context/", "provider.tsx"],
+  "+excluded_paths": ["/__snapshots__/", "/storybook-static/"]
 }
 ```
 
-**Custom frontend agent:**
-```python
-AGENT_DEFINITIONS["frontend_specialist"] = {
-    "subagent_type": "general-purpose",
-    "model": "haiku",
-    "checks": "React hooks dependencies, state updates, memory leaks, XSS vulnerabilities",
-    "context_checks": {
+Path patterns are matched lower-case, hence `provider.tsx`. The built-in `reviewer` already adds React-specific focus (hook dependencies, state batching, memory leaks) for `.ts`/`.tsx`/`.js`/`.jsx` files under `/frontend/`.
+
+To add a second opinion on the deep tier only:
+
+```json
+{
+  "preset": "relaxed",
+  "extra_agent_definitions": {
+    "frontend_specialist": {
+      "subagent_type": "general-purpose",
+      "model": "sonnet",
+      "checks": "React hook dependencies, state updates, memory leaks, XSS vulnerabilities",
+      "context_checks": {
         "frontend": "Check useMemo/useCallback usage, event handler cleanup, ref management"
+      }
     }
+  },
+  "agent_ids": {
+    "deep": ["reviewer", "frontend_specialist"]
+  }
 }
 ```
 
 ## Python Library
 
 ### Overview
-Reusable Python package, public API stability is critical.
-
-### Project Structure
-```
-mylib/
-├── mylib/
-│   ├── __init__.py
-│   ├── core.py
-│   └── utils.py
-├── tests/
-├── docs/
-└── examples/
-```
+Reusable Python package where public API stability is critical.
 
 ### Configuration
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# Strict for public API changes
-TIER_THRESHOLDS = {
-    "skip": 200,      # Very small changes
-    "quick": 1000,
-    "standard": 5000,
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "strict",
+  "review_checklist_file": "review-checklist.md",
+  "+critical_patterns": ["/__init__.py", "/core.py"],
+  "+excluded_paths": ["/examples/", "/docs/"],
+  "max_fail_retries": 1
 }
+```
 
-# Critical: any change to __init__.py (public API)
-CRITICAL_PATTERNS = [
-    "/__init__.py",
-    "/core.py",
-]
-
-# Strict retry limits
-MAX_AUTO_CONTINUES = 1
-MAX_FAIL_RETRIES = 1
-
-# Exclude examples and docs from review
-EXCLUDED_PATHS = [
-    "/examples/",
-    "/docs/",
-    "/tests/fixtures/",
-]
-
-# Focus on API stability and backward compatibility
-AGENT_DEFINITIONS["api_checker"] = {
-    "subagent_type": "general-purpose",
-    "model": "sonnet",
-    "checks": "breaking changes to public API, missing docstrings, type hint consistency",
-    "context_checks": {}
-}
-
-AGENT_IDS = {
-    "quick": ["explore_haiku", "api_checker"],
-    "standard": ["explore_haiku", "api_checker", "bug_hunter"],
-    "deep": ["explore_haiku", "api_checker", "bug_hunter", "general_sonnet"],
-}
+**.claude/hooks/review-checklist.md:**
+```markdown
+1. Breaking changes to the public API (names, signatures, return types, exceptions).
+2. Missing or inconsistent type hints and docstrings on public functions.
+3. Silent failures - swallowed exceptions, defaults returned on failure.
+4. Behaviour changes without a test; bug fixes without a regression test.
 ```
 
 ## Rapid Prototyping
 
 ### Overview
-Early-stage project, move fast, less strict review.
+Early-stage project; move fast, light review.
 
 ### Configuration
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# Very lenient thresholds
-TIER_THRESHOLDS = {
-    "skip": 3000,      # Skip most changes
-    "quick": 10000,
-    "standard": 50000,
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "minimal"
 }
+```
 
-TIER_FILE_LIMITS = {
-    "skip": 5,
-    "quick": 10,
-    "standard": 20,
+`minimal` raises the thresholds, allows 10 auto-continues, auto-fixes every deep finding and runs the reviewer on `sonnet`. To keep the reviewer on `opus`:
+
+```json
+{
+  "preset": "minimal",
+  "reviewer_model": "opus"
 }
-
-# Many auto-continues
-MAX_AUTO_CONTINUES = 10
-
-# Only use fast agents
-AGENT_IDS = {
-    "quick": ["explore_haiku"],
-    "standard": ["explore_haiku"],
-    "deep": ["explore_haiku", "general_haiku"],
-}
-
-# Minimal critical patterns
-CRITICAL_PATTERNS = []
-
-# Only catch serious bugs
-AGENT_DEFINITIONS["explore_haiku"]["checks"] = "critical bugs, security issues only"
 ```
 
 ## Production System
 
 ### Overview
-Mission-critical system, maximum rigor, comprehensive review.
+Mission-critical system, maximum rigor.
 
 ### Configuration
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# No skip tier - always review
-TIER_THRESHOLDS = {
-    "skip": 0,         # Everything reviewed
-    "quick": 500,
-    "standard": 3000,
-}
-
-TIER_FILE_LIMITS = {
-    "skip": 0,
-    "quick": 1,
-    "standard": 3,
-}
-
-# Very conservative
-MAX_AUTO_CONTINUES = 1
-MAX_FAIL_RETRIES = 1
-
-# Everything is critical
-CRITICAL_PATTERNS = [
-    "/",  # Match all files
-]
-
-# Maximum agents at all tiers
-AGENT_IDS = {
-    "quick": ["explore_haiku", "general_haiku"],
-    "standard": ["explore_haiku", "general_haiku", "bug_hunter", "security_checker"],
-    "deep": [
-        "explore_haiku",
-        "general_haiku",
-        "bug_hunter",
-        "general_sonnet",
-        "security_checker",
-        "performance_checker"
-    ],
-}
-
-# Add security-focused agent
-AGENT_DEFINITIONS["security_checker"] = {
-    "subagent_type": "general-purpose",
-    "model": "sonnet",
-    "checks": "SQL injection, XSS, CSRF, auth bypass, secrets exposure, input validation",
-    "context_checks": {
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "strict",
+  "review_checklist_file": "review-checklist.md",
+  "tier_thresholds": {"skip": 0, "quick": 500, "standard": 3000},
+  "tier_file_limits": {"skip": 0, "quick": 1, "standard": 3},
+  "max_auto_continues": 1,
+  "max_fail_retries": 1,
+  "deep_auto_fix": "none",
+  "extra_agent_definitions": {
+    "security_checker": {
+      "subagent_type": "general-purpose",
+      "model": "opus",
+      "checks": "SQL injection, XSS, CSRF, auth bypass, secrets exposure, input validation",
+      "context_checks": {
         "api_routes": "Check authentication, authorization, rate limiting",
         "database": "Check query parameterization, connection security"
+      }
+    },
+    "performance_checker": {
+      "subagent_type": "general-purpose",
+      "model": "sonnet",
+      "checks": "N+1 queries, inefficient algorithms, memory leaks, unbounded loops"
     }
-}
-
-# Add performance agent
-AGENT_DEFINITIONS["performance_checker"] = {
-    "subagent_type": "general-purpose",
-    "model": "sonnet",
-    "checks": "N+1 queries, inefficient algorithms, memory leaks, unbounded loops",
-    "context_checks": {
-        "database": "Check index usage, query efficiency"
-    }
+  },
+  "agent_ids": {
+    "standard": ["reviewer", "security_checker"],
+    "deep": ["reviewer", "security_checker", "performance_checker"]
+  }
 }
 ```
+
+With `skip` at 0 there is no skip tier: every change is reviewed. `deep_auto_fix: "none"` makes deep failures report-only so a human decides. Extra agents run in parallel with the reviewer in the same round, and the round fails if any of them fails.
 
 ## Open Source Project
 
 ### Overview
-Community-driven, need consistent quality, helpful for contributors.
+Community-driven; consistent quality, helpful for contributors.
 
 ### Configuration
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# Moderate thresholds
-TIER_THRESHOLDS = {
-    "skip": 500,
-    "quick": 3000,
-    "standard": 15000,
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "balanced",
+  "tier_thresholds": {"skip": 500, "quick": 3000, "standard": 15000},
+  "+critical_patterns": ["/src/api/", "/src/core/", "/__init__.py"],
+  "+excluded_paths": ["/examples/", "/docs/", "/tutorials/"],
+  "review_checklist_file": "review-checklist.md"
 }
+```
 
-# Standard auto-continue
-MAX_AUTO_CONTINUES = 3
-
-# Critical patterns focus on public API
-CRITICAL_PATTERNS = [
-    "/src/api/",
-    "/src/core/",
-    "/__init__.py",
-]
-
-# Exclude contributor-friendly areas from strict review
-EXCLUDED_PATHS = [
-    "/examples/",
-    "/docs/",
-    "/tutorials/",
-    "/tests/fixtures/",
-]
-
-# Friendly agent messaging
-AGENT_DEFINITIONS["explore_haiku"]["checks"] = (
-    "bugs, style issues (with suggestions for fixes), "
-    "missing tests, unclear variable names"
-)
-
-# Context-aware help
-AGENT_DEFINITIONS["contributor_helper"] = {
-    "subagent_type": "general-purpose",
-    "model": "haiku",
-    "checks": "contribution guidelines compliance, code style, test coverage",
-    "context_checks": {}
-}
-
-AGENT_IDS["quick"] = ["explore_haiku", "contributor_helper"]
+**.claude/hooks/review-checklist.md:**
+```markdown
+1. Bugs and silent failures, with a suggested fix for each.
+2. Missing tests for changed behaviour.
+3. Compliance with CONTRIBUTING.md (style, naming, commit scope).
+4. Public API compatibility.
 ```
 
 ## Monorepo
@@ -432,58 +262,25 @@ Multiple projects in one repo, different standards per project.
 ### Project Structure
 ```
 monorepo/
-├── packages/
-│   ├── ui-lib/       # UI component library
-│   ├── api-client/   # API client
-│   └── utils/        # Shared utilities
-├── apps/
-│   ├── web/          # Web application
-│   └── mobile/       # Mobile app
-└── services/
-    ├── api/          # Backend API
-    └── workers/      # Background workers
+├── packages/     # libraries: ui-lib, api-client, utils
+├── apps/         # web, mobile
+└── services/     # api, workers
 ```
 
 ### Configuration
 
-**stop-design-audit.py configuration:**
-```python
-# Results mode - inline (default) or file
-RESULTS_MODE = "inline"
-
-# Moderate defaults
-TIER_THRESHOLDS = {
-    "skip": 500,
-    "quick": 3000,
-    "standard": 15000,
-}
-
-# Project-specific critical patterns
-CRITICAL_PATTERNS = [
-    # Libraries (strict)
+**.claude/hooks/hook-overrides.json:**
+```json
+{
+  "preset": "balanced",
+  "tier_thresholds": {"skip": 500, "quick": 3000, "standard": 15000},
+  "+critical_patterns": [
     "/packages/ui-lib/src",
     "/packages/api-client/src",
-    "/packages/utils/src",
-
-    # Backend (strict)
     "/services/api/",
-    "/services/workers/",
-
-    # Less strict for apps
-    # (not listed)
-]
-
-# Context detection for monorepo
-def detect_project_context(files: list[str]) -> str:
-    """Detect which project the changes belong to."""
-    for f in files:
-        if "/packages/" in f:
-            return "library"
-        elif "/services/" in f:
-            return "backend"
-        elif "/apps/" in f:
-            return "frontend"
-    return "mixed"
+    "/services/workers/"
+  ]
+}
 ```
 
 **.claude/review-config.json:**
@@ -491,17 +288,14 @@ def detect_project_context(files: list[str]) -> str:
 {
   "module_boundaries": {
     "packages": {
-      "allowed_imports": [],
       "forbidden_imports": ["apps", "services"],
       "communication": "Packages are libraries - no app/service dependencies"
     },
     "apps": {
-      "allowed_imports": ["packages"],
       "forbidden_imports": ["services"],
       "communication": "Apps use packages and call services via API"
     },
     "services": {
-      "allowed_imports": ["packages"],
       "forbidden_imports": ["apps"],
       "communication": "Services can use packages but not app code"
     }
@@ -509,149 +303,31 @@ def detect_project_context(files: list[str]) -> str:
 }
 ```
 
-## Environment-Specific Configuration
+## Team Size
 
-### Development
-```python
-# Fast iteration
-TIER_THRESHOLDS = {"skip": 1000, "quick": 5000, "standard": 20000}
-MAX_AUTO_CONTINUES = 5
+**Solo developer:**
+```json
+{ "preset": "minimal" }
 ```
 
-### Staging
-```python
-# Balanced
-TIER_THRESHOLDS = {"skip": 500, "quick": 3000, "standard": 15000}
-MAX_AUTO_CONTINUES = 3
+**Small team:**
+```json
+{ "preset": "balanced" }
 ```
 
-### Production
-```python
-# Strict
-TIER_THRESHOLDS = {"skip": 200, "quick": 1000, "standard": 5000}
-MAX_AUTO_CONTINUES = 1
+**Large team, strict consistency:**
+```json
+{ "preset": "strict", "max_auto_continues": 1 }
 ```
-
-## Team Size Considerations
-
-### Solo Developer
-```python
-# More lenient, trust yourself
-MAX_AUTO_CONTINUES = 10
-TIER_THRESHOLDS = {"skip": 2000, "quick": 10000, "standard": 50000}
-```
-
-### Small Team (2-5)
-```python
-# Moderate review
-MAX_AUTO_CONTINUES = 3
-TIER_THRESHOLDS = {"skip": 500, "quick": 3000, "standard": 15000}
-```
-
-### Large Team (10+)
-```python
-# Strict consistency
-MAX_AUTO_CONTINUES = 1
-TIER_THRESHOLDS = {"skip": 200, "quick": 1000, "standard": 5000}
-```
-
-## Integration Examples
-
-### With Pre-commit Hooks
-
-```bash
-# .git/hooks/pre-commit
-#!/bin/bash
-
-# Run review on staged changes
-git diff --cached --name-only | python .claude/hooks/check-files.py
-
-# Helper script: check-files.py
-# (Custom script that uses stop-design-audit.py logic)
-```
-
-### With CI/CD
-
-```yaml
-# .github/workflows/review.yml
-name: AI Code Review
-
-on: [pull_request]
-
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Run Claude Review
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          # Generate transcript from PR diff
-          # Run stop-design-audit.py
-          # Post results as PR comment
-```
-
-## Results Mode Configuration
-
-All examples above use `RESULTS_MODE = "inline"` (the default). This section explains both modes.
-
-### Inline Mode (Default)
-
-```python
-RESULTS_MODE = "inline"
-```
-
-- **No extra permissions needed**
-- Claude embeds results in response with markers:
-  ```
-  <!--REVIEW_RESULTS_START-->
-  {"round_id": "abc12345", "agents": {...}}
-  <!--REVIEW_RESULTS_END-->
-  ```
-- Hook parses transcript to extract results
-- Recommended for most users
-
-### File Mode
-
-```python
-RESULTS_MODE = "file"
-```
-
-- **Requires permission** in `.claude/settings.local.json`:
-  ```json
-  {
-    "permissions": {
-      "allow": ["Write(.claude/hooks/review-results-*.json)"]
-    }
-  }
-  ```
-- Claude writes results to `.claude/hooks/review-results-{hash}.json`
-- Useful for external tooling integration
-- Cleaner file-based results
-
-### When to Use File Mode
-
-Consider file mode if:
-- You have external tools that need to read review results
-- You prefer persistent result files for auditing
-- Your CI/CD pipeline needs to process results
-- You're debugging and want to inspect raw result files
-
-For most interactive use, inline mode works well and requires no extra setup.
 
 ## Tips
 
-1. **Start conservative** - Begin strict, relax as needed
-2. **Measure metrics** - Use `stop-hook-metrics.jsonl` to tune
-3. **Team consensus** - Agree on thresholds with team
-4. **Iterate** - Adjust based on real usage patterns
-5. **Document** - Explain why you chose certain values
+1. **Start conservative** - begin with `strict` or tight thresholds, relax with evidence from `.claude/hooks/state/stop-hook-metrics.jsonl`.
+2. **Invest in the checklist** - one good project checklist beats extra agents.
+3. **Extra agents cost a full agent run per round** - add one only for a concern the checklist cannot express.
+4. **Team consensus** - agree on thresholds with the team and commit `hook-overrides.json`; keep `.claude/hooks/state/` out of git.
+5. **Provenance** - every metrics record carries the hook `version` and a `config_fingerprint`, so you can tell which configuration produced a review.
 
 ## Getting Help
 
-Can't find an example for your use case? Open an issue describing:
-- Your project type/structure
-- Team size and workflow
-- Pain points with current settings
-- Desired behavior
+Can't find an example for your use case? Open an issue describing your project type, team size, pain points and desired behavior.

@@ -23,13 +23,14 @@ def get_session_hash(transcript_path: str) -> str:
 def run_hook(transcript_path: Path, env_overrides: dict | None = None) -> tuple[int, str, str]:
     """Run the hook and return (exit_code, stdout, stderr)."""
     import os
-    env = os.environ.copy()
+    # Strip the caller's CLAUDE_HOOK_* settings so the test sees hook defaults
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_HOOK_")}
     # Force agent mode + DEEP_AUTO_FIX=none so inline plan agent path is triggered
     env["CLAUDE_HOOK_REVIEW_MODE"] = "agent"
     env["CLAUDE_HOOK_DEEP_AUTO_FIX"] = "none"
     if env_overrides:
         env.update(env_overrides)
-    input_json = json.dumps({"transcript_path": str(transcript_path)})
+    input_json = json.dumps({"transcript_path": str(transcript_path), "stop_hook_active": False})
     result = subprocess.run(
         [sys.executable, str(HOOK_SCRIPT)],
         input=input_json,
@@ -87,7 +88,9 @@ def test_deep_failure_returns_plan_instructions():
             }) + "\n")
 
         session_hash = get_session_hash(str(transcript_path))
-        state_path = HOOK_DIR / f"stop-hook-state-{session_hash}.json"
+        # Runtime state lives in <hooks_dir>/state/ (v3 layout)
+        state_path = HOOK_DIR / "state" / f"stop-hook-state-{session_hash}.json"
+        state_path.parent.mkdir(exist_ok=True)
 
         # State: deep review in progress with matching round_id
         state = {

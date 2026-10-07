@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from dataclasses import dataclass, field
+from typing import NoReturn
 
 from stop_design_audit.agents import get_required_agents
 from stop_design_audit.classify import (
@@ -13,8 +13,6 @@ from stop_design_audit.classify import (
     should_run_integration_review,
 )
 from stop_design_audit.config import (
-    DEEP_AUTO_FIX,
-    DEEP_AUTO_FIX_ENV,
     MAX_AUTO_CONTINUES,
     MAX_FAIL_RETRIES,
     MAX_PREVIEW_CHARS,
@@ -22,8 +20,14 @@ from stop_design_audit.config import (
     ROUND_ID_LENGTH,
     STATUS_FAIL,
     STATUS_PASS,
+    effective_deep_auto_fix,
 )
-from stop_design_audit.exit_helpers import allow_stop, block_with_message, log
+from stop_design_audit.exit_helpers import (
+    allow_stop,
+    block_with_message,
+    log,
+    warn_and_allow,
+)
 from stop_design_audit.instructions import (
     GIT_FIX_CONSTRAINT,
     GIT_READONLY_CONSTRAINT,
@@ -61,6 +65,16 @@ def get_continue_message(auto_continue_count: int) -> str:
     return "If tasks remain, continue with implementation. Otherwise, identify next logical steps or improvements to consider."
 
 
+def allow_skipping_edits(ctx: ReviewContext, why: str) -> NoReturn:
+    """Allow the stop; warn visibly if new edits are being marked as seen unreviewed."""
+    if ctx.incremental_diff or ctx.incremental_files:
+        warn_and_allow(
+            f"{why}: {abs(ctx.incremental_diff)} chars across "
+            f"{len(ctx.incremental_files)} new file(s) were NOT reviewed."
+        )
+    allow_stop(why)
+
+
 def check_completion_guards(state: ReviewState, ctx: ReviewContext) -> None:
     """Check completed, max_continues, max_fails. Exits if triggered.
 
@@ -77,7 +91,7 @@ def check_completion_guards(state: ReviewState, ctx: ReviewContext) -> None:
         state.last_files_seen = ctx.all_files_seen
         state.tier = ctx.tier
         state.save()
-        allow_stop("Review cycle already completed")
+        allow_skipping_edits(ctx, "review cycle already completed")
 
     if state.auto_continue_count >= MAX_AUTO_CONTINUES:
         log(f"Max auto continues reached ({MAX_AUTO_CONTINUES}) - allowing stop")
@@ -86,7 +100,7 @@ def check_completion_guards(state: ReviewState, ctx: ReviewContext) -> None:
         state.tier = old_tier or ctx.tier
         state.completed = True
         state.save()
-        allow_stop("Max auto-continues reached")
+        allow_skipping_edits(ctx, "auto-continue limit reached")
 
     if state.fail_count >= MAX_FAIL_RETRIES:
         log(
@@ -110,7 +124,8 @@ def handle_tier_change(state: ReviewState, new_tier: str) -> None:
     if state.tier and state.tier != new_tier:
         log(f"Tier changed ({state.tier} -> {new_tier}) - starting new review round")
         state.passed_agents = []
-        state.fail_count = 0
+        # fail_count is NOT reset here: it bounds the whole hook-forced chain
+        # (State.start_turn resets it per user turn).
         state.round_id = uuid.uuid4().hex[:ROUND_ID_LENGTH]
 
 
@@ -126,16 +141,22 @@ def get_pending_agents_and_context(
 ) -> tuple[list[str], list[str], dict | None]:
     """Determine required agents, pending agents, and integration context.
 
+    Cross-module changes no longer add a separate agent; the integration
+    context is handed to the reviewer(s) as extra focus. Its values are
+    sorted lists so payloads stay JSON-serializable.
+
     Returns: (required_agents, pending_agents, integration_context)
     """
-    required_agents = get_required_agents(ctx.tier)
+    required_agents = list(get_required_agents(ctx.tier))
     needs_integration, top_dirs, crit_patterns = should_run_integration_review(
         list(ctx.incremental_files)
     )
     integration_context = None
     if needs_integration:
-        required_agents = required_agents + ["integration_checker"]
-        integration_context = {"dirs": top_dirs, "patterns": crit_patterns}
+        integration_context = {
+            "dirs": sorted(top_dirs),
+            "patterns": sorted(crit_patterns),
+        }
 
     pending_agents = [a for a in required_agents if a not in state.passed_agents]
     return required_agents, pending_agents, integration_context
@@ -167,6 +188,7 @@ def get_code_hunks_and_violations(
     return code_hunks, import_violations
 
 
+# TODO(VIOLATION): legacy agent/delegated fail-open — exhausted attempts are treated as a PASS. Subagent mode (default) is fail-loud; delete legacy modes or port them (tracking: v3 design-audit review round 656dfe68).
 def check_circuit_breaker(
     state: ReviewState, ctx: ReviewContext, old_round_id: str
 ) -> None:
@@ -232,7 +254,7 @@ def process_results(
             agents=required,
             outcome=STATUS_FAIL,
             fail_count=state.fail_count,
-            session_id=state.session_id,
+            session_id=state.session_hash,
         )
 
         if ctx.tier == "deep":
@@ -248,14 +270,14 @@ def process_results(
                 agents=required,
                 outcome=STATUS_PASS,
                 fail_count=state.fail_count,
-                session_id=state.session_id,
+                session_id=state.session_hash,
             )
             handle_all_passed(state, ctx)
 
     return True
 
 
-def handle_all_passed(state: ReviewState, ctx: ReviewContext) -> None:
+def handle_all_passed(state: ReviewState, ctx: ReviewContext) -> NoReturn:
     """Handle the case when all review agents have passed. Exits."""
     state.auto_continue_count += 1
     log(f"All agents passed! auto_continue_count now {state.auto_continue_count}")
@@ -296,7 +318,7 @@ def handle_deep_failure(
     ctx: ReviewContext,
     failed_agents: list[str],
     agents_results: dict,
-) -> None:
+) -> NoReturn:
     """Handle deep review failure. Exits."""
     total_issues = sum(
         len(data.get("issues", []))
@@ -311,7 +333,7 @@ def handle_deep_failure(
     state.completed = True
     state.save()
 
-    effective_auto_fix = os.environ.get(DEEP_AUTO_FIX_ENV, "").lower() or DEEP_AUTO_FIX
+    effective_auto_fix = effective_deep_auto_fix()
 
     if effective_auto_fix != "none":
         # Auto-fix mode

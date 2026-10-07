@@ -1,315 +1,280 @@
 # Configuration Guide
 
-This guide covers all configuration options for Claude on Rails Review.
+Complete configuration reference for Claude on Rails Review 3.0.0.
 
 ## Table of Contents
 
-- [Basic Setup](#basic-setup)
-- [Results Mode](#results-mode)
+- [Where Configuration Lives](#where-configuration-lives)
+- [Validation (Fail Loud)](#validation-fail-loud)
+- [Key Reference](#key-reference)
+- [Presets](#presets)
 - [Tier Configuration](#tier-configuration)
-- [Agent Configuration](#agent-configuration)
+- [Reviewer and Models](#reviewer-and-models)
+- [Review Checklist](#review-checklist)
+- [Custom Agents](#custom-agents)
+- [Fix Strategy and Deep Auto-Fix](#fix-strategy-and-deep-auto-fix)
+- [Loop Bounds](#loop-bounds)
 - [File Filtering](#file-filtering)
+- [Critical Patterns](#critical-patterns)
 - [Module Boundaries](#module-boundaries)
-- [Advanced Options](#advanced-options)
+- [Environment Variables](#environment-variables)
+- [Runtime Files](#runtime-files)
+- [Results Contract](#results-contract)
+- [Other Review Modes](#other-review-modes)
+- [Debugging](#debugging)
+- [Best Practices](#best-practices)
 
-## Basic Setup
+## Where Configuration Lives
 
-### Installation
+| File | Location | Purpose |
+|------|----------|---------|
+| `settings.json` | `.claude/` | Registers the hook with Claude Code |
+| `hook-overrides.json` | `.claude/hooks/` | Project overrides (see [`hook-overrides.example.json`](hook-overrides.example.json)) |
+| checklist file | `.claude/hooks/` (or absolute path) | Optional project review checklist |
+| `review-config.json` | `.claude/` | Module boundaries and optional `force_tier` |
+| `state/` | `.claude/hooks/state/` | Everything the hook writes (git-ignore it) |
 
-1. Copy `stop-design-audit.py` to `.claude/hooks/` in your project
-2. Add hook configuration to `.claude/settings.json`:
+Defaults are in [`stop_design_audit/config.py`](stop_design_audit/config.py). Prefer `hook-overrides.json` over editing the package, so upgrades are a plain copy.
+
+Register the hook in `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 30000
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python .claude/hooks/stop-design-audit.py",
+        "timeout": 30
+      }]
     }]
   }
 }
 ```
 
-### Review Mode
+**Merge order:** defaults, then `preset`, then explicit keys in `hook-overrides.json`, then environment variables.
 
-Choose between agent mode (recommended) and API mode:
+## Validation (Fail Loud)
 
-```python
-# Agent mode - Uses Claude Code Task subagents (no API key needed)
-REVIEW_MODE = "agent"
+`hook-overrides.json` and the `CLAUDE_HOOK_*` environment variables are validated on every run. Every problem found is listed, and nothing from the file is applied if any key is invalid. The hook then fails loud: the user sees a `systemMessage` and Claude is blocked once to relay it (see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#hook-error---code-review-did-not-run)).
 
-# API mode - Calls Anthropic API directly (requires ANTHROPIC_API_KEY)
-REVIEW_MODE = "api"
-```
+These are errors:
 
-## Results Mode
+- invalid JSON, or a top level that is not an object
+- an unknown key (including keys removed in 3.0.0 such as `subagent_timeout`)
+- a wrong type, a negative number, or a boolean where an integer is expected
+- an invalid enum value for `review_mode`, `results_mode` or `deep_auto_fix`
+- an empty `reviewer_model` or `fixer_model`
+- `tier_thresholds` / `tier_file_limits` that do not define exactly `skip`, `quick` and `standard`
+- `agent_ids` with an unknown tier (valid: `quick`, `standard`, `deep`) or an empty list
+- an unknown `preset`
+- `+key` append syntax on a key that is not a list
+- a `review_checklist_file` that does not exist
+- an agent in `agent_ids` that is not defined, or an `extra_agent_definitions` entry missing `subagent_type`, `model` or `checks`
+- an invalid `CLAUDE_HOOK_*` value, an invalid `.claude/review-config.json`, or an invalid `force_tier`
 
-Choose how review results are delivered from Claude to the hook.
+The only keys that are not configuration values are `preset`, `extra_agent_definitions`, `_doc` and `_comment`. Use `_doc` or `_comment` for notes.
 
-### Inline Mode (Default)
+## Key Reference
 
-```python
-RESULTS_MODE = "inline"
-```
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `preset` | string | none | `strict`, `balanced`, `relaxed`, `minimal` |
+| `review_mode` | string | `"subagent"` | `subagent`, `agent`, `delegated`, `api` |
+| `reviewer_model` | string | `"opus"` | Model of the built-in `reviewer` agent |
+| `fixer_model` | string | `"sonnet"` | Model of the fix agent |
+| `review_checklist_file` | string | `""` | Project checklist replacing the built-in one |
+| `deep_auto_fix` | string | `"high"` | `none`, `critical`, `high`, `medium`, `all` |
+| `tier_thresholds` | object | `{"skip":500,"quick":5000,"standard":20000}` | Characters per tier (replaced as a whole) |
+| `tier_file_limits` | object | `{"skip":1,"quick":3,"standard":6}` | Files per tier (replaced as a whole) |
+| `max_auto_continues` | int | `3` | Passing reviews before Claude may stop |
+| `max_fail_retries` | int | `3` | Failed reviews before the retry circuit breaker |
+| `max_review_attempts` | int | `2` | Attempts per round to obtain valid results (first request plus re-requests) |
+| `state_expiry` | int | `3600` | Seconds before session state counts as stale |
+| `critical_patterns` | list | `[]` | Path substrings; see [Critical Patterns](#critical-patterns) |
+| `excluded_extensions` | list | see [File Filtering](#file-filtering) | File extensions to skip |
+| `excluded_filenames` | list | see [File Filtering](#file-filtering) | Exact file names to skip |
+| `excluded_paths` | list | see [File Filtering](#file-filtering) | Path substrings to skip |
+| `+critical_patterns`, `+excluded_extensions`, `+excluded_filenames`, `+excluded_paths` | list | none | Append to the current value instead of replacing it |
+| `agent_ids` | object | `{"quick":["reviewer"],"standard":["reviewer"],"deep":["reviewer"]}` | Agents per tier (merged per tier) |
+| `extra_agent_definitions` | object | `{}` | Custom agent definitions |
+| `results_mode` | string | `"inline"` | `agent`/`delegated` modes only |
+| `delegated_timeout` | int | `300` | `delegated` mode only |
+| `api_diff_threshold` | int | `500` | `api` mode only |
 
-Claude outputs results with markers embedded in its response (2-space indented JSON):
+All integers must be non-negative. All lists must contain strings only.
 
-```
-<!--REVIEW_RESULTS_START-->
-{
-  "round_id": "a3f8d921",
-  "agents": {
-    "explore_haiku": {
-      "status": "pass",
-      "issues": []
-    }
-  }
-}
-<!--REVIEW_RESULTS_END-->
-```
+## Presets
 
-**Pros:**
-- No file write permissions needed
-- Results are in conversation history
-- Works out of the box
+A preset is a bundle of keys applied before your explicit keys.
 
-**Cons:**
-- Slightly more complex parsing (JSONL transcript extraction)
+| Preset | skip / quick / standard (chars) | File limits | `max_auto_continues` | `deep_auto_fix` | Other |
+|--------|-------------------------------|-------------|----------------------|-----------------|-------|
+| `strict` | 0 / 500 / 3000 | 0 / 1 / 3 | 1 | `none` | |
+| `balanced` | 500 / 5000 / 20000 | 1 / 3 / 6 | 3 | `high` | the defaults |
+| `relaxed` | 1000 / 5000 / 20000 | 3 / 5 / 10 | 5 | `high` | |
+| `minimal` | 3000 / 10000 / 50000 | 5 / 10 / 20 | 10 | `all` | `reviewer_model` = `sonnet` |
 
-### File Mode
-
-```python
-RESULTS_MODE = "file"
-```
-
-Claude writes results directly to a JSON file:
-```
-.claude/hooks/review-results-{session_hash}.json
-```
-
-**Requires permission in `.claude/settings.local.json`:**
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "Write(.claude/hooks/review-results-*.json)"
-    ]
-  }
-}
-```
-
-**Permission options (from most to least restrictive):**
-
-| Pattern | What it allows |
-|---------|----------------|
-| `Write(.claude/hooks/review-results-*.json)` | Only review results files (recommended) |
-| `Write(.claude/hooks/*.json)` | Any JSON file in hooks dir |
-| `Write(.claude/hooks/**)` | Any file in hooks dir |
-
-**Pros:**
-- Clean file-based results for external tooling
-- Simpler parsing
-
-**Cons:**
-- Requires adding write permission to settings.local.json
+With `strict`, `skip` is `0`, so no change is small enough to skip.
 
 ## Tier Configuration
 
-### Tier Thresholds
+The hook classifies the incremental change (since the last hook firing) by size. A tier applies when the change is under its character threshold AND within its file limit; the checks run in the order skip, quick, standard; anything larger is deep.
 
-Control when each review tier triggers based on character changes:
-
-```python
-TIER_THRESHOLDS = {
-    "skip": 500,       # <500 chars: no review
-    "quick": 5000,     # 500-5000 chars: lightweight review
-    "standard": 20000, # 5000-20000 chars: standard review
-    # ≥20000 chars: deep review (implicit)
+```json
+{
+  "tier_thresholds": {"skip": 500, "quick": 5000, "standard": 20000},
+  "tier_file_limits": {"skip": 1, "quick": 3, "standard": 6}
 }
 ```
 
-### File Count Limits
+**Example:** 400 characters across 2 files exceeds the skip file limit, so it is a quick review.
 
-Tier must meet BOTH character threshold AND file count:
+### What a Tier Changes
 
-```python
-TIER_FILE_LIMITS = {
-    "skip": 1,      # 1 file max for skip tier
-    "quick": 3,     # ≤3 files for quick tier
-    "standard": 6,  # ≤6 files for standard tier
-    # >6 files: deep review (implicit)
+Every tier runs the same single reviewer. The tier sets the effort the reviewer is told to apply:
+
+| Tier | Effort given to the reviewer |
+|------|------------------------------|
+| quick | Focused pass: the changed lines and their direct callers/callees |
+| standard | Read every changed file in full; check direct callers/callees and tests |
+| deep | Exhaustive: read every changed file in full, trace cross-module dependencies, verify contracts and signatures at every call site, check edge cases, ordering and side effects |
+
+Tiers also differ in how failures are handled; see [Fix Strategy](#fix-strategy-and-deep-auto-fix).
+
+## Reviewer and Models
+
+The built-in agent id is `reviewer` (`subagent_type` `general-purpose`). Its model comes from `reviewer_model`; the fix agent's model comes from `fixer_model`:
+
+```json
+{
+  "reviewer_model": "opus",
+  "fixer_model": "sonnet"
 }
 ```
 
-**Example:** A change with 400 characters but 2 files will use **quick** tier (exceeds skip file limit).
+Use a cheaper `reviewer_model` (for example `sonnet`) for speed or cost; the `minimal` preset does this. Any non-empty string is accepted and passed to the Agent tool as `model`; the hook does not check that the model exists.
 
-### Auto-Continue Settings
+The five agents of earlier versions (`explore_haiku`, `general_haiku`, `bug_hunter`, `integration_checker`, `general_opus`) no longer exist. Remove them from `agent_ids`; they are now an error.
 
-Control how many successful review passes before manual approval:
+## Review Checklist
 
-```python
-MAX_AUTO_CONTINUES = 3  # How many passes before requiring stop
-MAX_FAIL_RETRIES = 3    # How many retry rounds when agents find issues
-STATE_EXPIRY = 3600     # Seconds - reset state if older than this (1 hour)
+The reviewer is given a checklist. The built-in default covers:
+
+1. Silent failures - swallowed exceptions, defaults returned on failure, execution continuing after a validation error
+2. Correctness - null access, off-by-one, race conditions, resource leaks, unhandled edge cases
+3. Contracts and integration - changed signatures/schemas with callers not updated, cross-module import violations
+4. Security - injection, missing authn/authz checks, secrets in code or logs
+5. Hardcoding - values that belong in config, a registry or a schema
+6. Tests - changed behaviour without coverage; bug fixes without a regression test
+
+To use your own checklist, point `review_checklist_file` at a text or markdown file. The path is relative to the hooks directory (`.claude/hooks/`) or absolute:
+
+```json
+{ "review_checklist_file": "review-checklist.md" }
 ```
 
-## Agent Configuration
+The file **replaces** the default checklist entirely. Include the generic items in your file if you still want them. A missing file is a config error. The file's SHA-256 is part of the config fingerprint, so editing it changes the fingerprint in metrics.
 
-### Agent Definitions
+The checklist applies to the `reviewer` agent only. Custom agents use their own `checks` text.
 
-Customize agents spawned for each tier:
+## Custom Agents
 
-```python
-AGENT_IDS = {
-    "quick": ["explore_haiku"],
-    "standard": ["explore_haiku", "general_haiku", "bug_hunter"],
-    "deep": ["explore_haiku", "general_haiku", "bug_hunter", "general_sonnet"],
-}
-```
+The default is one reviewer. To run additional or different reviewers, define them and list them per tier:
 
-### Customizing Agent Checks
-
-Modify what each agent looks for:
-
-```python
-AGENT_DEFINITIONS = {
-    "explore_haiku": {
-        "subagent_type": "Explore",
-        "model": "haiku",
-        "checks": "code smells, obvious bugs, hardcoded values, missing error handling",
-        "context_checks": {
-            "proto": "Check field numbering, message compatibility, enum values",
-            "database": "Check migration reversibility, index definitions",
-        }
-    },
-    "general_haiku": {
-        "subagent_type": "general-purpose",
-        "model": "haiku",
-        "checks": "silent failures (return None/[]), missing validation, security issues",
-        "context_checks": {
-            "api_routes": "Check input validation, error responses, authentication",
-            "grpc_service": "Check error handling, request validation",
-        }
-    },
-    # ... add your own agents ...
-}
-```
-
-### Adding Custom Agents
-
-1. Add agent ID to `AGENT_IDS` for desired tier
-2. Add agent definition to `AGENT_DEFINITIONS`:
-
-```python
-AGENT_DEFINITIONS["security_checker"] = {
-    "subagent_type": "general-purpose",
-    "model": "sonnet",
-    "checks": "SQL injection, XSS, CSRF, authentication bypass",
-    "context_checks": {
-        "api_routes": "Check auth middleware, rate limiting",
+```json
+{
+  "extra_agent_definitions": {
+    "security_checker": {
+      "subagent_type": "general-purpose",
+      "model": "sonnet",
+      "checks": "OWASP top 10, input sanitization, auth bypass vectors",
+      "context_checks": {
+        "api_routes": "Check for missing auth middleware, rate limiting"
+      }
     }
+  },
+  "agent_ids": {
+    "deep": ["reviewer", "security_checker"]
+  }
 }
 ```
+
+Rules:
+
+- Each definition needs `subagent_type`, `model` and `checks` (non-empty). `context_checks` is optional.
+- `agent_ids` may only reference defined agents: `reviewer` or an id from `extra_agent_definitions`. Anything else is a config error.
+- `agent_ids` is merged per tier. Setting `deep` replaces the deep list and leaves `quick` and `standard` alone. Include `"reviewer"` if you still want it.
+- A custom agent is reviewed against its own `checks` text, not the checklist file. It only gets the context hints you define in its own `context_checks`; the built-in `reviewer` has all of them.
+- All agents of a round are started in one message, in the foreground. Each gets its own prompt and results file. The round fails if any agent reports `fail`.
+
+Context names available to `context_checks`: `proto` (`.proto` files), `grpc_service` (`_service.py`), `database` (`/models/`, `/migrations/`), `api_routes` (`/routes/`, `/api/`), `frontend` (`.ts`/`.tsx`/`.js`/`.jsx` under `/frontend/`).
+
+## Fix Strategy and Deep Auto-Fix
+
+When a reviewer reports `fail`:
+
+| Tier | Behavior |
+|------|----------|
+| quick, standard | ALL issues go to ONE fix agent (`general-purpose`, model `fixer_model`, foreground) |
+| deep | `deep_auto_fix` decides which severities are fixed: `critical`, `high`, `medium` (each includes the more severe levels), `all`, or `none` |
+
+With `deep_auto_fix` set to `none`, deep failures are reported to the user and Claude does not fix them unless asked. Lower-severity issues below the threshold are reported without fixing. The environment variable `CLAUDE_HOOK_DEEP_AUTO_FIX` overrides the setting.
+
+**Example:** with `deep_auto_fix` = `high`, a deep review finding 2 critical, 3 high and 5 medium issues sends the 5 critical and high issues to the fix agent and reports the 5 medium ones.
+
+**Fixes are not re-reviewed.** The hook only sees edits made in the main session transcript; edits by a subagent are invisible to it. The failure message says so.
+
+## Loop Bounds
+
+A blocking Stop hook must always terminate. These bounds are unchanged in 3.0.0:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `max_auto_continues` | 3 | After this many passes the hook allows the stop. Message on a pass: `Design audit passed. [Auto-continue N of 3] Continue.` |
+| `max_fail_retries` | 3 | Failed reviews before the hook reports "retries exhausted" and hands off to the user |
+| `max_review_attempts` | 2 | Attempts to get valid results for one round. With 2: the first request plus one re-request, then an UNREVIEWED warning |
 
 ## File Filtering
 
-### Excluded Extensions
+A file is ignored when its name, extension (case-insensitive) or path (lower-cased, forward slashes, substring match) matches. Defaults:
 
-Skip review for these file types:
+- `excluded_extensions`: `.json .md .txt .yml .yaml .toml .ini .cfg .lock .sum`
+- `excluded_filenames`: `LICENSE LICENCE Makefile Dockerfile Procfile Gemfile Rakefile Vagrantfile Brewfile .gitignore .gitattributes .dockerignore .editorconfig`
+- `excluded_paths`: `/tests/fixtures/ /test/fixtures/ /__pycache__/ /.pytest_cache/ /node_modules/ /.venv/ /venv/ /build/ /dist/ /.git/ /coverage/ /.coverage /htmlcov/`
 
-```python
-EXCLUDED_EXTENSIONS = {
-    ".json", ".md", ".txt",
-    ".yml", ".yaml",
-    ".toml", ".ini", ".cfg",
-    ".lock", ".sum",
+Use the plain key to replace a list and the `+` form to extend it:
+
+```json
+{
+  "+excluded_paths": ["/docs/", "/scripts/"],
+  "+excluded_extensions": [".css", ".scss"]
 }
 ```
 
-### Excluded Paths
+Write path patterns in lower case; they are matched against the lower-cased path.
 
-Skip review for files matching these patterns (case-insensitive):
+## Critical Patterns
 
-```python
-EXCLUDED_PATHS = [
-    "/tests/fixtures/",
-    "/test/fixtures/",
-    "/__pycache__/",
-    "/.pytest_cache/",
-    "/node_modules/",
-    "/.venv/",
-    "/venv/",
-    "/build/",
-    "/dist/",
-    "/.git/",
-    "/coverage/",
-    "/docs/examples/",
-    "/scripts/temp/",
-    "/scratch/",
-]
-```
+`critical_patterns` is a list of path substrings, empty by default. A change that touches files matching **two or more different patterns** is treated as cross-module: the reviewer is told which critical paths were touched and to check callers and contracts across those boundaries. The same hint is added when the change spans two or more top-level directories. Critical patterns do not force a tier and do not add agents.
 
-**Pattern Matching:** Uses substring matching with forward slashes. Example: `/tests/fixtures/` matches `src/tests/fixtures/data.json`.
-
-### Critical Patterns
-
-Changes to these paths trigger deeper review regardless of size:
-
-```python
-CRITICAL_PATTERNS = [
-    "/api/",
-    "/routes/",
-    "/models/",
-    "_service.py",
-    "/proto/",
-    "/migrations/",
-]
+```json
+{ "+critical_patterns": ["/api/", "/models/", "/migrations/"] }
 ```
 
 ## Module Boundaries
 
-### Setup
-
-1. Create `.claude/review-config.json` in your project root
-2. Define module rules (see example below)
-
-### Configuration Format
+Create `.claude/review-config.json` (one level above the hooks directory):
 
 ```json
 {
-  "module_boundaries": {
-    "module_name": {
-      "allowed_imports": ["list", "of", "allowed", "modules"],
-      "forbidden_imports": ["list", "of", "forbidden", "modules"],
-      "communication": "Human-readable message when violation detected"
-    }
-  }
-}
-```
-
-### Example: Microservices Architecture
-
-```json
-{
+  "force_tier": "deep",
   "module_boundaries": {
     "api": {
-      "allowed_imports": ["core", "shared"],
       "forbidden_imports": ["services", "internal"],
       "communication": "Must use gRPC to communicate with services"
     },
-    "services": {
-      "allowed_imports": ["core", "shared"],
-      "forbidden_imports": ["api", "frontend"],
-      "communication": "Use gRPC for inter-service communication"
-    },
-    "frontend": {
-      "allowed_imports": ["shared"],
-      "forbidden_imports": ["api", "services", "core"],
-      "communication": "Must use REST API or WebSocket only"
-    },
     "core": {
-      "allowed_imports": [],
       "forbidden_imports": ["api", "services", "frontend"],
       "communication": "Core is a shared library - no dependencies on other modules"
     }
@@ -317,236 +282,137 @@ CRITICAL_PATTERNS = [
 }
 ```
 
-### How It Works
-
-The hook checks code changes for import statements:
-
-```python
-# ❌ VIOLATION: api/routes/users.py
-from services.auth import AuthService  # Forbidden!
-
-# ✅ OK: api/routes/users.py
-from core.models import User  # Allowed
-```
-
-Violations are reported in review instructions with the `communication` message.
-
-## Deep Review Auto-Fix
-
-Control whether deep review failures automatically fix issues or stop and wait.
-
-### Configuration
-
-```python
-# Deep review auto-fix threshold.
-# "none"     = stop and wait for user (current behavior)
-# "critical" = auto-fix critical only, report rest
-# "high"     = auto-fix critical + high, report rest
-# "medium"   = auto-fix critical + high + medium, report rest
-# "all"      = auto-fix everything
-DEEP_AUTO_FIX = "none"
-```
-
-### Environment Variable Override
-
-```bash
-export CLAUDE_HOOK_DEEP_AUTO_FIX="high"
-```
-
-### How It Works
-
-When `DEEP_AUTO_FIX` is set to anything other than `"none"`:
-
-1. Deep review failures filter issues by severity threshold
-2. Qualifying issues (at or above the threshold) are passed to a subagent for fixing
-3. Lower-severity issues are reported but not fixed
-4. Claude resumes its prior task after the subagent completes
-
-When `DEEP_AUTO_FIX = "none"` (default), deep review failures trigger the plan agent and stop for user review — the original behavior.
-
-**Severity hierarchy:** critical > high > medium > low
-
-**Example:** With `DEEP_AUTO_FIX = "high"`, a deep review finding 2 critical, 3 high, and 5 medium issues will auto-fix the 5 critical+high issues and report the 5 medium issues without fixing.
-
-## Fix Strategy
-
-### Non-Deep Tiers (Quick, Standard)
-
-When review agents find violations, Claude spawns a single general-purpose subagent (model=sonnet) to fix all issues. This keeps fixes out of the main context, preserving Claude's train of thought.
-
-### Deep Tier
-
-Controlled by `DEEP_AUTO_FIX` (see above). Default behavior stops and waits for user review.
-
-## Context Restoration
-
-After a review completes and Claude is instructed to continue, the hook automatically extracts context from the transcript:
-
-- **Last user request** (truncated to 200 chars)
-- **Last 5 tool actions** (tool name + file path)
-
-This context is appended to all continue/resume messages, helping Claude pick up where it left off instead of losing its train of thought.
-
-## Advanced Options
-
-### API Mode Settings
-
-Only used when `REVIEW_MODE = "api"`:
-
-```python
-API_DIFF_THRESHOLD = 500  # chars - below uses Haiku, above uses Sonnet
-```
-
-### File Paths
-
-State files are stored in `.claude/hooks/`:
-
-```python
-DEBUG_FILE = Path(__file__).parent / "stop-hook-debug.log"
-METRICS_FILE = Path(__file__).parent / "stop-hook-metrics.jsonl"
-# Session-specific files use hash suffix:
-# stop-hook-state-{session_hash}.json
-# review-results-{session_hash}.json  (file mode only)
-```
-
-**Note:** The `review-results-*.json` file is only created in file mode. In inline mode (default), results are embedded in Claude's response and extracted from the transcript.
-
-### Integration Checker
-
-The `integration_checker` agent is added automatically when:
-
-1. Changes span 2+ top-level directories (e.g., `api/` and `services/`)
-2. Changes touch 2+ critical patterns (e.g., `/proto/` and `/api/`)
-
-This ensures cross-module consistency is checked.
-
-### Context Detection
-
-The hook automatically detects file contexts for specialized checks:
-
-- `proto` - Protocol buffer files (`.proto`)
-- `grpc_service` - gRPC service implementations (`_service.py`)
-- `database` - Database models/migrations (`/models/`, `/migrations/`)
-- `api_routes` - API route handlers (`/routes/`, `/api/`)
-- `frontend` - Frontend files (`.tsx`, `.jsx` in `/frontend/`)
-
-Agents use these contexts to apply specialized checks from `context_checks`.
-
-## Configuration Best Practices
-
-### Start Conservative
-
-Begin with stricter settings and relax as needed:
-
-```python
-# Stricter thresholds
-TIER_THRESHOLDS = {"skip": 200, "quick": 1000, "standard": 5000}
-MAX_AUTO_CONTINUES = 1  # Require approval more often
-```
-
-### Project Size Matters
-
-Adjust thresholds based on project size:
-
-**Small projects (<10K LOC):**
-```python
-TIER_THRESHOLDS = {"skip": 1000, "quick": 5000, "standard": 20000}
-MAX_AUTO_CONTINUES = 5
-```
-
-**Large projects (>100K LOC):**
-```python
-TIER_THRESHOLDS = {"skip": 300, "quick": 2000, "standard": 10000}
-MAX_AUTO_CONTINUES = 2
-```
-
-### Critical Projects
-
-For production systems requiring strict review:
-
-```python
-# No skip tier - always review
-TIER_THRESHOLDS = {"skip": 0, "quick": 1000, "standard": 5000}
-MAX_AUTO_CONTINUES = 1
-MAX_FAIL_RETRIES = 1
-
-# Add all agents to quick tier
-AGENT_IDS["quick"] = ["explore_haiku", "general_haiku", "bug_hunter"]
-```
-
-### Fast Iteration
-
-For rapid prototyping/experimentation:
-
-```python
-# Lenient thresholds
-TIER_THRESHOLDS = {"skip": 2000, "quick": 10000, "standard": 50000}
-MAX_AUTO_CONTINUES = 10
-
-# Only use fast agents
-AGENT_IDS["standard"] = ["explore_haiku", "general_haiku"]
-AGENT_IDS["deep"] = ["explore_haiku", "general_haiku"]
-```
-
-## Debugging Configuration
-
-### Enable Verbose Logging
-
-Check `.claude/hooks/stop-hook-debug.log` for detailed execution logs:
-
-```bash
-tail -f .claude/hooks/stop-hook-debug.log
-```
-
-### Test Configuration
-
-Manually trigger the hook with a test transcript:
-
-```bash
-echo '{"transcript_path": "/path/to/transcript.jsonl"}' | python .claude/hooks/stop-design-audit.py
-```
-
-### View Current State
-
-Check session state:
-
-```bash
-cat .claude/hooks/stop-hook-state.json | jq
-```
-
-### Reset State
-
-Start fresh by deleting state files:
-
-```bash
-# Delete session state files
-rm .claude/hooks/stop-hook-state-*.json
-
-# Delete results files (file mode only)
-rm .claude/hooks/review-results-*.json
-```
-
-**Note:** In inline mode (default), review results are embedded in the transcript, not stored in separate files.
+- The module of a file is its first path segment (`api/routes/users.py` is module `api`; a file at the project root has no module).
+- The hook looks for `from <forbidden>` and `import <forbidden>` in the code preview of the change. Matches are given to the reviewer as extra focus together with the `communication` text.
+- Only `forbidden_imports` and `communication` are enforced. `allowed_imports` is accepted but not used.
+- `force_tier` (optional) must be `quick`, `standard` or `deep`; anything else is a config error. It beats `CLAUDE_HOOK_FORCE_TIER`.
+
+See [`review-config.example.json`](review-config.example.json).
 
 ## Environment Variables
 
 | Variable | Values | Description |
 |----------|--------|-------------|
-| `CLAUDE_HOOK_FORCE_TIER` | `deep`, `standard`, `quick` | Force a specific review tier (bypass threshold checks) |
-| `CLAUDE_HOOK_SKIP` | `1` | Temporarily disable the hook (snooze) |
-| `CLAUDE_HOOK_DEEP_AUTO_FIX` | `none`, `critical`, `high`, `medium`, `all` | Override deep review auto-fix threshold |
-| `ANTHROPIC_API_KEY` | `sk-ant-...` | API key for API mode |
+| `CLAUDE_HOOK_SKIP` | `0`, `1` | `1` disables the hook for this run |
+| `CLAUDE_HOOK_FORCE_TIER` | `quick`, `standard`, `deep` | Force a tier, bypassing thresholds |
+| `CLAUDE_HOOK_DEEP_AUTO_FIX` | `none`, `critical`, `high`, `medium`, `all` | Override `deep_auto_fix` |
+| `CLAUDE_HOOK_REVIEW_MODE` | `subagent`, `agent`, `delegated`, `api` | Override `review_mode` |
+| `ANTHROPIC_API_KEY` | key | Only for `api` mode |
 
-### API Mode
+Values are validated before anything else runs, so a typo is a visible error even with `CLAUDE_HOOK_SKIP=1`.
 
-Set your Anthropic API key for API mode:
+## Runtime Files
+
+Everything the hook writes lives in `<hooks_dir>/state/` (normally `.claude/hooks/state/`). Add it to `.gitignore`:
+
+```
+.claude/hooks/state/
+```
+
+| File | Contents |
+|------|----------|
+| `stop-hook-state-<session>.json` | Counters, current round, pending review |
+| `review-prompt-<session>-<round>-<agent>.md` | Prompt the reviewer reads |
+| `review-results-<session>-<round>-<agent>.json` | Results the reviewer writes |
+| `stop-hook-debug.log` | Debug log, truncated when above 1 MB |
+| `stop-hook-metrics.jsonl` | One record per review round; the last 5000 lines are kept |
+
+`<session>` is the first 12 hex characters of an MD5 of the transcript path; `<round>` is an 8-character id. Files older than 24 hours are removed. `agent` and `delegated` modes also write `review-results-<session>.json` and `coordinator-instructions-<session>.json` here.
+
+Every metrics record contains `version`, `config_fingerprint` (SHA-256 over the effective config, the hook version and the checklist file contents), `tier`, `diff_chars`, `file_count`, `agents`, `outcome`, `fail_count`, `timestamp` and `session_id` (the first 8 characters of the session hash).
+
+The reviewer needs to write its results file. To avoid a permission prompt add to `.claude/settings.local.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Write(.claude/hooks/state/review-results-*.json)"]
+  }
+}
+```
+
+## Results Contract
+
+The reviewer writes one JSON file per (session, round, agent):
+
+```json
+{
+  "round_id": "a3f8d921",
+  "agent_id": "reviewer",
+  "status": "fail",
+  "issues": [
+    {
+      "file": "api/routes/users.py",
+      "line": 42,
+      "severity": "high",
+      "category": "silent-failure",
+      "description": "get_user returns None on DB error, so the caller renders an empty profile"
+    }
+  ]
+}
+```
+
+The hook accepts a file only if all of these hold, with no repair and no partial acceptance:
+
+- valid JSON object
+- `round_id` and `agent_id` equal the expected values
+- `status` is `"pass"` or `"fail"`
+- `issues` is a list; each issue has `file` (string), `line` (integer or `null`), `severity` (`critical`, `high`, `medium` or `low`), `category` (string), `description` (string)
+- `status` is `"fail"` if there is any `critical` issue or two or more `high` issues
+
+A missing file, or one that breaks the contract, is re-requested once; if it still fails the user sees an UNREVIEWED warning. The results are read at the next stop before any diff check, because a foreground review adds no edits to the main transcript.
+
+## Other Review Modes
+
+`review_mode` also accepts `agent` (inline instructions), `delegated` (background coordinator) and `api` (direct Anthropic API, needs `ANTHROPIC_API_KEY`). These remain available and use `results_mode`, `delegated_timeout` and `api_diff_threshold`. They are not the recommended path and are not covered further here; the 3.0.0 reviewer flow, results files and `reviewer_model`/`fixer_model` settings apply to `subagent` mode.
+
+## Debugging
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+# Watch the debug log
+tail -f .claude/hooks/state/stop-hook-debug.log
+
+# Inspect session state
+jq . .claude/hooks/state/stop-hook-state-*.json
+
+# Reset state
+rm .claude/hooks/state/stop-hook-state-*.json
 ```
+
+Run the hook by hand with a transcript:
+
+```bash
+echo '{"transcript_path": "/path/to/transcript.jsonl"}' | python .claude/hooks/stop-design-audit.py
+```
+
+Run from the project root; an empty `{}` input fails loud ("hook input has no transcript_path"), which also confirms the package imports.
+
+## Best Practices
+
+**Start conservative, relax with evidence.** Begin with `strict` or tighter thresholds and use the metrics file to loosen them.
+
+```json
+{ "preset": "strict" }
+```
+
+**Production systems:** no skip tier, one auto-continue, fail fast.
+
+```json
+{
+  "tier_thresholds": {"skip": 0, "quick": 1000, "standard": 5000},
+  "tier_file_limits": {"skip": 0, "quick": 2, "standard": 4},
+  "max_auto_continues": 1,
+  "max_fail_retries": 1,
+  "deep_auto_fix": "none"
+}
+```
+
+**Rapid iteration:** `{ "preset": "minimal" }`.
+
+**Review quality comes from the checklist.** Put your project's real invariants in `review_checklist_file` instead of adding agents.
 
 ## Next Steps
 
-- See [README.md](README.md) for feature overview
-- Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common issues
-- Review [EXAMPLES.md](EXAMPLES.md) for configuration examples
+- [README.md](README.md) - feature overview
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - common issues
+- [EXAMPLES.md](EXAMPLES.md) - configuration examples

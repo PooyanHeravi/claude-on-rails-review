@@ -1,12 +1,12 @@
 # Quick Start Guide
 
-Get up and running with Claude on Rails Review in 5 minutes.
+Get up and running with Claude on Rails Review 3.0.0 in 5 minutes.
 
 ## Prerequisites
 
-- **Python 3.10+** - Check with `python --version`
-- **Claude Code CLI** - Install with `npm install -g @anthropic-ai/claude-code`
-- **Git** - For version control (recommended)
+- **Python 3.10+** - check with `python --version`
+- **Claude Code CLI** - install with `npm install -g @anthropic-ai/claude-code`
+- **Git** - recommended
 
 ## Installation
 
@@ -15,9 +15,8 @@ Get up and running with Claude on Rails Review in 5 minutes.
 ```bash
 # Clone or download the repository
 git clone https://github.com/PooyanHeravi/claude-on-rails-review.git
-cd claude-on-rails-review
 
-# Copy to your project
+# Run the installer from your project root
 cd /path/to/your/project
 bash /path/to/claude-on-rails-review/install.sh
 ```
@@ -28,7 +27,7 @@ bash /path/to/claude-on-rails-review/install.sh
 # In your project root
 mkdir -p .claude/hooks
 
-# Copy the shim AND the package — they must live together
+# Copy the shim AND the package - they must live together
 cp -r /path/to/claude-on-rails-review/stop-design-audit.py \
       /path/to/claude-on-rails-review/stop_design_audit \
       .claude/hooks/
@@ -38,109 +37,84 @@ chmod +x .claude/hooks/stop-design-audit.py
 cat > .claude/settings.json << 'EOF'
 {
   "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 30000
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python .claude/hooks/stop-design-audit.py",
+        "timeout": 30
+      }]
     }]
   }
 }
 EOF
+```
 
-# Add to .gitignore
-cat >> .gitignore << 'EOF'
+### Git-Ignore the Runtime Directory
 
-# Claude on Rails Review
-.claude/hooks/stop-hook-*.json
-.claude/hooks/stop-hook-*.log
-.claude/hooks/review-results-*.json
-EOF
+All runtime files live in `.claude/hooks/state/`:
+
+```bash
+echo ".claude/hooks/state/" >> .gitignore
+```
+
+### Optional: Allow the Results File
+
+The reviewer writes its results file with the Write tool. To avoid a permission prompt, add to `.claude/settings.local.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Write(.claude/hooks/state/review-results-*.json)"]
+  }
+}
 ```
 
 ## Verify Installation
 
 ```bash
-# Test the hook
-echo '{"transcript_path":"/tmp/test.jsonl"}' | python .claude/hooks/stop-design-audit.py
-
-# Should output: "No transcript_path in input" or similar
-# If it runs without Python errors, you're good!
+echo '{}' | python .claude/hooks/stop-design-audit.py
 ```
+
+Expected: a JSON line containing `hook error — code review did NOT run: ValueError: hook input has no transcript_path`. The hook fails loud on empty input; this proves the package imports and your config is valid. A message starting with `invalid config:` lists what to fix in `.claude/hooks/hook-overrides.json`.
 
 ## First Use
 
 1. **Start Claude Code in your project:**
 
 ```bash
-claude code
+claude
 ```
 
-2. **Make a small change:**
+2. **Make a small change.** For example "Add a comment to one file". The change is under 500 characters in one file, so the hook skips review and Claude stops normally.
+
+3. **Make a bigger change.** For example "Refactor the authentication module to use JWT tokens". The hook now blocks the stop and asks Claude to run the reviewer:
 
 ```
-You: "Add a comment to the README"
+DESIGN AUDIT [STANDARD] round abc12345: +8547 chars across 5 file(s).
+Run the review now, before anything else.
+In ONE message, make 1 Agent call(s) with run_in_background=false:
+  - subagent_type='general-purpose', model='opus', description='design audit abc12345 (reviewer)', prompt='Read .../state/review-prompt-<session>-abc12345-reviewer.md and follow it exactly.'
+When the review returns, end your turn. The stop hook reads the results file(s) and reports the outcome — do not act on the review yourself.
 ```
 
-Claude will make the change and try to stop. The hook will run automatically!
+4. **The reviewer reviews and writes its results file.** When Claude ends its turn, the hook reads the file:
 
-3. **See the review:**
-
-Since the change is small (<500 chars), it will skip review and Claude will stop normally.
-
-4. **Make a bigger change:**
-
-```
-You: "Refactor the authentication module to use JWT tokens"
-```
-
-Now the hook will trigger a review! You'll see:
-
-```
-STANDARD_REVIEW: +8547 chars, 5 files across 2 module(s) [Round: abc12345]
-
-Spawn 3 Task agents IN PARALLEL (single message, multiple tool calls):
-
-1. subagent_type='Explore', model='haiku' [ID: explore_haiku]
-   Check: code smells, obvious bugs, hardcoded values
-
-2. subagent_type='general-purpose', model='haiku' [ID: general_haiku]
-   Check: silent failures, missing validation, security issues
-
-3. subagent_type='general-purpose', model='sonnet' [ID: bug_hunter]
-   Check: null access, race conditions, resource leaks
-
-Files:
-  api/
-    - routes/auth.py
-    - middleware/jwt.py
-  core/
-    - models/user.py
-    - utils/tokens.py
-  tests/
-    - test_auth.py
-
-[Auto-continue 1 of 3] If no issues found, continue with implementation.
-```
-
-Claude will spawn the review agents, they'll check your code, and report back!
+- **Pass:** `Design audit passed. [Auto-continue 1 of 3] Continue.`
+- **Fail:** the issues are listed and a fix agent (`fixer_model`, default `sonnet`) is asked to fix them.
+- **No valid results:** the hook asks once more, then warns that the changes are UNREVIEWED.
 
 ## Understanding the Output
 
-### Tier Indicators
+### Tiers
 
-- **`SKIP`** - Very small change, no review needed
-- **`QUICK_REVIEW`** - Small change, lightweight check
-- **`STANDARD_REVIEW`** - Medium change, thorough review
-- **`DEEP_REVIEW`** - Large change, comprehensive audit
+| Tier | Incremental change | What happens |
+|------|--------------------|--------------|
+| skip | <500 chars, 1 file | No review |
+| quick | <5000 chars, <=3 files | One reviewer, focused pass |
+| standard | <20000 chars, <=6 files | One reviewer, reads every changed file |
+| deep | larger | One reviewer, exhaustive pass |
 
-### Agent Progress
-
-Watch as agents complete:
-
-```
-✓ explore_haiku: PASSED (skip)
-✓ general_haiku: PASSED (skip)
-✗ bug_hunter: FAILED - 2 issues found
-```
+The tier scales the reviewer's effort, never the number of agents.
 
 ### Auto-Continue Counter
 
@@ -148,99 +122,83 @@ Watch as agents complete:
 [Auto-continue 1 of 3]
 ```
 
-Shows how many successful reviews before manual approval required.
+Shows how many passing reviews have occurred out of the maximum before Claude is allowed to stop.
 
 ## Configuration Basics
 
-### Results Mode
+Create `.claude/hooks/hook-overrides.json` (see [`hook-overrides.example.json`](hook-overrides.example.json)). The file is validated on every run, so typos are reported instead of ignored.
 
-By default, the hook uses **inline mode** - no extra permissions needed. Claude embeds results in its response with markers.
-
-To use **file mode** (results written to JSON file), set `RESULTS_MODE` in [`stop_design_audit/config.py`](stop_design_audit/config.py) or override it in `.claude/hooks/hook-overrides.json`:
+### Pick a Preset
 
 ```json
-{ "RESULTS_MODE": "file" }
+{ "preset": "balanced" }
 ```
 
-Then add permission to `.claude/settings.local.json`:
+`strict`, `balanced`, `relaxed` or `minimal`. See [SETUP.md](SETUP.md#step-2-choose-a-preset).
+
+### Choose Models
 
 ```json
 {
-  "permissions": {
-    "allow": ["Write(.claude/hooks/review-results-*.json)"]
-  }
+  "reviewer_model": "sonnet",
+  "fixer_model": "sonnet"
 }
 ```
 
-### Adjust Review Thresholds
+`reviewer_model` defaults to `opus`, `fixer_model` to `sonnet`.
 
-Edit [`stop_design_audit/config.py`](stop_design_audit/config.py) (or override in `hook-overrides.json`):
+### Use Your Own Checklist
 
-```python
-# Make it more/less strict
-TIER_THRESHOLDS = {
-    "skip": 500,       # <500 chars: no review (change to 1000 for more lenient)
-    "quick": 5000,     # 500-5000 chars: quick review
-    "standard": 20000, # 5000-20000 chars: standard review
+```json
+{ "review_checklist_file": "review-checklist.md" }
+```
+
+The file lives in `.claude/hooks/` (or use an absolute path) and replaces the built-in checklist.
+
+### Adjust Thresholds
+
+```json
+{
+  "tier_thresholds": {"skip": 1000, "quick": 5000, "standard": 20000},
+  "tier_file_limits": {"skip": 1, "quick": 3, "standard": 6}
 }
 ```
 
-### Change Auto-Continue Limit
+Both objects must define all three tiers.
 
-```python
-MAX_AUTO_CONTINUES = 3  # Change to 5 or 10 for fewer interruptions
+### Change the Auto-Continue Limit
+
+```json
+{ "max_auto_continues": 5 }
 ```
 
-### Exclude File Types
+### Exclude Files and Paths
 
-```python
-EXCLUDED_EXTENSIONS = {
-    ".json", ".md", ".txt",  # Add more: ".yaml", ".toml", etc.
+```json
+{
+  "+excluded_extensions": [".css"],
+  "+excluded_paths": ["/docs/", "/scripts/temp/"]
 }
-```
-
-### Exclude Paths
-
-```python
-EXCLUDED_PATHS = [
-    "/tests/",          # Skip all tests
-    "/docs/",           # Skip documentation
-    "/scripts/temp/",   # Skip temporary scripts
-]
 ```
 
 ## Common Use Cases
 
-### "I want less interruption"
+**Less interruption**
 
-```python
-MAX_AUTO_CONTINUES = 10  # More passes before stopping
-TIER_THRESHOLDS["skip"] = 2000  # Skip more changes
+```json
+{ "preset": "relaxed" }
 ```
 
-### "I want stricter review"
+**Stricter review**
 
-```python
-MAX_AUTO_CONTINUES = 1   # Stop after each review
-TIER_THRESHOLDS["skip"] = 200  # Review even small changes
+```json
+{ "preset": "strict" }
 ```
 
-### "I only want to review API changes"
+**Faster, cheaper reviews**
 
-```python
-CRITICAL_PATTERNS = ["/api/", "/routes/"]  # Only these paths
-TIER_THRESHOLDS["skip"] = 10000  # Skip everything else
-```
-
-### "Speed up reviews"
-
-```python
-# Use only fast Haiku agents
-AGENT_IDS = {
-    "quick": ["explore_haiku"],
-    "standard": ["explore_haiku"],
-    "deep": ["explore_haiku", "general_haiku"],
-}
+```json
+{ "reviewer_model": "sonnet" }
 ```
 
 ## Troubleshooting
@@ -248,98 +206,41 @@ AGENT_IDS = {
 ### Hook not running?
 
 ```bash
-# Check settings
 cat .claude/settings.json
-
-# Check hook exists
 ls -la .claude/hooks/stop-design-audit.py
-
-# Test manually
-echo '{"transcript_path":"test"}' | python .claude/hooks/stop-design-audit.py
+echo '{}' | python .claude/hooks/stop-design-audit.py
 ```
 
-### Reviews taking too long?
+### "hook error — code review did NOT run"?
 
-- Reduce agent count (edit `AGENT_IDS`)
-- Use only Haiku agents (faster)
-- Increase tier thresholds (fewer reviews)
+The hook failed loudly. The text after the colon says why (invalid config, missing transcript, corrupt state file). See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-### Too many false positives?
+### Changes marked UNREVIEWED?
 
-- Increase `MAX_AUTO_CONTINUES` (ignore more)
-- Adjust agent checks (edit `AGENT_DEFINITIONS`)
-- Exclude problematic paths (edit `EXCLUDED_PATHS`)
+The reviewer did not write a valid results file after a re-request. Check the permission above, then `.claude/hooks/state/review-results-*.json` and the debug log.
 
-### Want to reset state?
+### Reset state
 
 ```bash
-rm .claude/hooks/stop-hook-state-*.json
-rm .claude/hooks/review-results-*.json  # File mode only
-```
-
-### Results not appearing (file mode)?
-
-1. Check `RESULTS_MODE = "file"` is set
-2. Verify permission in `.claude/settings.local.json`
-3. Check for write errors in debug log
-
-### Can't find review results (inline mode)?
-
-Results are embedded in Claude's response with markers:
-```
-<!--REVIEW_RESULTS_START-->
-{"round_id": "...", "agents": {...}}
-<!--REVIEW_RESULTS_END-->
+rm .claude/hooks/state/stop-hook-state-*.json
 ```
 
 ## Debug Output
 
-Check the logs:
-
 ```bash
-# Watch in real-time
-tail -f .claude/hooks/stop-hook-debug.log
-
-# View metrics
-cat .claude/hooks/stop-hook-metrics.jsonl | jq
+tail -f .claude/hooks/state/stop-hook-debug.log
+jq . .claude/hooks/state/stop-hook-metrics.jsonl
 ```
 
 ## Next Steps
 
-Now that you're running:
-
-1. **Customize thresholds** - Adjust to your workflow
-2. **Set up module boundaries** - See [CONFIGURATION.md](CONFIGURATION.md)
-3. **Review metrics** - Use `.claude/hooks/stop-hook-metrics.jsonl`
-4. **Read examples** - See [EXAMPLES.md](EXAMPLES.md) for your project type
+1. **Write a project checklist** - see [CONFIGURATION.md](CONFIGURATION.md#review-checklist)
+2. **Set up module boundaries** - see [CONFIGURATION.md](CONFIGURATION.md#module-boundaries)
+3. **Review metrics** - `.claude/hooks/state/stop-hook-metrics.jsonl`
+4. **Read examples** - [EXAMPLES.md](EXAMPLES.md)
 
 ## Getting Help
 
-- **Documentation**: See README.md, CONFIGURATION.md, TROUBLESHOOTING.md
-- **Examples**: Check EXAMPLES.md for your project type
-- **Issues**: Open an issue on GitHub
-- **Debug**: Check `.claude/hooks/stop-hook-debug.log`
-
-## Tips
-
-✅ **Do:**
-- Start with default settings
-- Adjust based on metrics
-- Exclude non-critical paths
-- Use faster agents for quick iteration
-
-❌ **Don't:**
-- Make thresholds too strict initially
-- Review documentation files
-- Review test fixtures
-- Forget to add state files to .gitignore
-
----
-
-**You're all set! Happy coding with automated review! 🚂**
-
-For more details, see:
-- [README.md](README.md) - Full feature overview
-- [CONFIGURATION.md](CONFIGURATION.md) - Complete configuration guide
-- [EXAMPLES.md](EXAMPLES.md) - Real-world configurations
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Common issues
+- **Documentation**: README.md, CONFIGURATION.md, TROUBLESHOOTING.md
+- **Issues**: open an issue on GitHub
+- **Debug**: `.claude/hooks/state/stop-hook-debug.log`

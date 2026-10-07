@@ -8,6 +8,7 @@ from stop_design_audit.config import MAX_TRANSCRIPT_CHARS_FOR_API
 from stop_design_audit.exit_helpers import log
 
 
+# TODO(VIOLATION): legacy api mode fail-open — every error returns no violations, which reads as 'review passed'; model ids hardcoded. Subagent mode (default) is fail-loud; delete legacy modes or port them (tracking: v3 design-audit review round 656dfe68).
 def call_anthropic_review(transcript_path: str, use_sonnet: bool) -> dict:
     """Call Anthropic API to review the conversation for violations."""
     try:

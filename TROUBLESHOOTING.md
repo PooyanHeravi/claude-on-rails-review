@@ -1,603 +1,264 @@
 # Troubleshooting Guide
 
-Common issues and solutions for Claude on Rails Review.
+Common issues and solutions for Claude on Rails Review 3.0.0.
 
 ## Table of Contents
 
 - [Hook Not Running](#hook-not-running)
-- [Results Mode Issues](#results-mode-issues)
-- [Review Never Completes](#review-never-completes)
-- [Agents Not Spawning](#agents-not-spawning)
+- [Hook Error: code review did NOT run](#hook-error---code-review-did-not-run)
+- [Review Never Completes or Is UNREVIEWED](#review-never-completes-or-is-unreviewed)
+- [Reviewer Not Starting](#reviewer-not-starting)
+- [Results File Problems](#results-file-problems)
 - [False Positives](#false-positives)
 - [Performance Issues](#performance-issues)
 - [State File Issues](#state-file-issues)
 - [Module Boundary Errors](#module-boundary-errors)
+- [Upgrading from 2.x](#upgrading-from-2x)
+- [Debug Mode](#debug-mode)
+- [Getting Help](#getting-help)
+- [Known Limitations](#known-limitations)
 
 ## Hook Not Running
 
-### Problem: Hook doesn't execute when Claude stops
+**Symptoms:** no review instructions appear, no `state/` directory activity, empty debug log.
 
-**Symptoms:**
-- No review instructions appear
-- State files aren't created
-- Debug log is empty
-
-**Solutions:**
-
-1. **Check hook configuration in `.claude/settings.json`:**
+1. **Check the hook registration in `.claude/settings.json`:**
 
 ```json
 {
   "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 30000
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python .claude/hooks/stop-design-audit.py",
+        "timeout": 30
+      }]
     }]
   }
 }
 ```
 
-2. **Verify file path:**
+2. **Verify the files exist** (the shim and the package must be side by side):
 
 ```bash
-# Should exist
-ls -la .claude/hooks/stop-design-audit.py
-
-# Check permissions (Unix/Linux/Mac)
-chmod +x .claude/hooks/stop-design-audit.py
+ls -la .claude/hooks/stop-design-audit.py .claude/hooks/stop_design_audit/
+chmod +x .claude/hooks/stop-design-audit.py   # Unix/macOS
 ```
 
-3. **Test Python execution:**
+3. **Run it by hand:**
 
 ```bash
-# Should print help/error
-python .claude/hooks/stop-design-audit.py
-
-# Check Python version (requires 3.10+)
-python --version
+echo '{}' | python .claude/hooks/stop-design-audit.py
 ```
 
-4. **Check Claude Code version:**
+A JSON line with `hook error — code review did NOT run: ValueError: hook input has no transcript_path` is the expected result and means the hook itself works. A Python traceback (`ImportError`, `SyntaxError`) means the package did not copy correctly or Python is older than 3.10.
+
+4. **Is it being skipped on purpose?** `CLAUDE_HOOK_SKIP=1` disables the hook. Changes that only touch excluded files (`.md`, `.json`, `.yml`, lock files, `/node_modules/`, ...) and changes under the skip threshold (500 characters in one file by default) also produce no review.
+
+## Hook Error: code review did NOT run
+
+```
+[stop-design-audit] hook error — code review did NOT run: <reason> (log: .../state/stop-hook-debug.log)
+```
+
+This is the hook failing loud. It never allows the stop silently: the user gets this message and Claude is blocked once so it relays the error. If that stop is already a hook-forced continuation (`stop_hook_active`), the message is shown as a warning only, so it cannot loop. Fix the reason; nothing was reviewed in the meantime.
+
+Common reasons:
+
+| Reason | Cause | Fix |
+|--------|-------|-----|
+| `invalid config: hook-overrides.json: unknown key 'subagent_timeout'` | Key removed or misspelled | Remove or correct it; see [Upgrading from 2.x](#upgrading-from-2x) |
+| `invalid config: hook-overrides.json: 'deep_auto_fix' must be one of [...]` | Bad enum or type | Use a listed value |
+| `invalid config: hook-overrides.json: unknown preset 'x'` | Preset name | Use `strict`, `balanced`, `relaxed`, `minimal` |
+| `invalid config: hook-overrides.json: cannot parse: ...` | Invalid JSON | Validate with `jq empty .claude/hooks/hook-overrides.json` |
+| `invalid config: review_checklist_file not found: <path>` | Checklist path wrong | The path is relative to `.claude/hooks/` (or absolute) |
+| `invalid config: agent_ids.deep references undefined agent 'explore_haiku'` | Old agent id, or an agent without a definition | Use `reviewer` or define the agent in `extra_agent_definitions` |
+| `invalid config: extra_agent_definitions.x missing ['checks']` | Incomplete definition | Provide `subagent_type`, `model` and `checks` |
+| `invalid config: CLAUDE_HOOK_FORCE_TIER='x' must be one of [...]` | Bad environment variable | Fix or unset it (checked even with `CLAUDE_HOOK_SKIP=1`) |
+| `invalid config: .../review-config.json: ...` | Bad module-boundaries file or `force_tier` | Fix the JSON; `force_tier` must be `quick`, `standard` or `deep` |
+| `ValueError: hook input has no transcript_path` | Hook run without Claude Code input | Normal when run by hand with `{}` |
+| `FileNotFoundError: [Errno 2] No such file or directory: '<transcript>'` | Transcript path unreadable | A missing transcript is not treated as "no changes"; check the path Claude Code passes |
+| `ValueError: corrupt state file ...` | State file truncated or edited | Delete that `state/stop-hook-state-*.json` (a corrupt file is never reset silently because it could hold a pending review) |
+| `JSONDecodeError: ...` | Hook input was not valid JSON | Only seen when run by hand |
+
+The config validator reports every problem at once, so fix the whole list before retrying. Details are in `state/stop-hook-debug.log`.
+
+## Review Never Completes or Is UNREVIEWED
+
+The review runs as a foreground agent in the main session, so there is no background process to wait for. What can go wrong is the results file.
+
+Messages and what they mean:
+
+- `DESIGN AUDIT round <id> has no valid results yet: <detail>` - the hook found no results file, or one that breaks the contract, and asks again (once with the default `max_review_attempts` of 2). Claude should re-run the reviewer.
+- `design audit round <id> produced no valid results after 2 attempt(s) (...). These changes are UNREVIEWED.` - the re-request also failed. Nothing was reviewed. Re-run the review by making another change, or run a review manually; check the points below to prevent a repeat.
+- `Review retries exhausted (N failures, max 3)` - the reviewer failed `max_fail_retries` times. The hook hands over to the user; read the findings and decide.
+
+Checklist:
+
+1. **Is a results file being written?**
 
 ```bash
-claude --version
-# Update if needed: npm install -g @anthropic-ai/claude-code
+ls -la .claude/hooks/state/review-results-*.json
 ```
 
-## Results Mode Issues
+2. **Does it match the current round?**
 
-### Understanding Results Modes
-
-Claude on Rails Review supports two results delivery modes:
-
-| Mode | Default | Permissions | How Results Arrive |
-|------|---------|-------------|-------------------|
-| **inline** | Yes | None needed | Embedded in Claude's response with markers |
-| **file** | No | `Write(.claude/hooks/review-results-*.json)` | Written to JSON file |
-
-Check your current mode in `stop-design-audit.py`:
-
-```python
-RESULTS_MODE = "inline"  # or "file"
-```
-
-### Problem: Results not appearing (inline mode)
-
-**Symptoms:**
-- Review instructions sent but results not detected
-- Hook times out waiting for results
-- No errors in debug log
-
-**Solutions:**
-
-1. **Verify inline markers in Claude's response:**
-
-Results should appear between these markers:
-```
-<!--REVIEW_RESULTS_START-->
-{"round_id": "abc12345", "agents": {...}}
-<!--REVIEW_RESULTS_END-->
-```
-
-2. **Check transcript parsing:**
-
-The hook parses the JSONL transcript to find markers. Verify:
 ```bash
-# Look for markers in transcript
-grep -a "REVIEW_RESULTS" <transcript_path>
+jq .round_id .claude/hooks/state/stop-hook-state-*.json
+jq '{round_id, agent_id, status}' .claude/hooks/state/review-results-*.json
 ```
 
-3. **Manual extraction test:**
-```python
-# Test the extraction function
-python -c "
-from stop_design_audit import _extract_results_from_transcript
-result = _extract_results_from_transcript('/path/to/transcript.jsonl')
-print(result)
-"
-```
-
-### Problem: Results not appearing (file mode)
-
-**Symptoms:**
-- File `review-results-{hash}.json` not created
-- Permission denied errors
-- Claude asks for file write permission
-
-**Solutions:**
-
-1. **Add write permission to `.claude/settings.local.json`:**
+3. **Can the reviewer write there?** If Claude Code asks for permission or denies the write, allow it in `.claude/settings.local.json`:
 
 ```json
 {
   "permissions": {
-    "allow": ["Write(.claude/hooks/review-results-*.json)"]
+    "allow": ["Write(.claude/hooks/state/review-results-*.json)"]
   }
 }
 ```
 
-2. **Verify mode is set correctly:**
-```python
-RESULTS_MODE = "file"  # Must be "file", not "inline"
-```
+4. **Read the debug log:** `tail -50 .claude/hooks/state/stop-hook-debug.log`
 
-3. **Check file path:**
-```bash
-# Results file location
-ls -la .claude/hooks/review-results-*.json
-```
+## Reviewer Not Starting
 
-### Problem: Switching between modes
+**Symptoms:** the `DESIGN AUDIT [TIER] round ...` message appears but Claude does not launch the agent.
 
-When switching modes, clear old state:
+1. The message names the exact Agent call (subagent type, model, prompt file). Ask Claude: "Please run the design audit review as instructed."
+2. Check the prompt file exists: `ls .claude/hooks/state/review-prompt-*-reviewer.md`
+3. Check the configured model is valid for your account (`reviewer_model`); an unavailable model can make the Agent call fail before a results file is written.
+4. If you defined custom agents, check their `subagent_type` and `model`.
 
-```bash
-# Clear all state files
-rm .claude/hooks/stop-hook-state-*.json
-rm .claude/hooks/review-results-*.json  # File mode only
-```
+## Results File Problems
 
-## Review Never Completes
+The hook validates the results file strictly (no repair, no partial acceptance). The detail in the message names the problem:
 
-### Problem: Hook blocks indefinitely, agents never finish
+| Message fragment | Meaning |
+|------------------|---------|
+| `no results file` | The reviewer did not write it (or wrote it elsewhere) |
+| `is not valid JSON` | Malformed JSON, for example a Markdown code fence written into the file |
+| `round_id is 'x', expected 'y'` | The reviewer used a stale or wrong round id |
+| `agent_id is 'x', expected 'y'` | Wrong agent id |
+| `status must be 'pass' or 'fail'` | Missing or other status value |
+| `issues[N].line is missing or mistyped` | `line` must be an integer or `null`; every issue needs `file`, `line`, `severity`, `category`, `description` |
+| `issues[N].severity must be one of [...]` | Use `critical`, `high`, `medium` or `low` |
+| `status is 'pass' but issues meet the fail criteria` | A `critical` issue or two or more `high` issues require `status: "fail"` |
 
-**Symptoms:**
-- Claude stuck in "reviewing" state
-- No progress after spawning agents
-- Timeout after 30 seconds
+The expected shape is in [CONFIGURATION.md](CONFIGURATION.md#results-contract) and is repeated inside each prompt file.
 
-**Solutions:**
-
-1. **Check results format (both modes):**
-
-Agents must output results in this exact format:
-
-**Inline mode:**
-```
-<!--REVIEW_RESULTS_START-->
-{"round_id": "abc12345", "agents": {"explore_haiku": {"status": "pass", "issues": []}}}
-<!--REVIEW_RESULTS_END-->
-```
-
-**File mode:**
-```json
-{
-  "round_id": "abc12345",
-  "agents": {
-    "explore_haiku": {
-      "status": "pass",
-      "issues": []
-    }
-  }
-}
-```
-
-2. **Verify round_id matches:**
-
-```bash
-# Check state file
-jq .round_id .claude/hooks/stop-hook-state-*.json
-
-# For file mode, check results file
-jq .round_id .claude/hooks/review-results-*.json
-```
-
-3. **Check for hung agents:**
-
-If agents don't complete, review will timeout. Check debug log:
-
-```bash
-tail -50 .claude/hooks/stop-hook-debug.log
-```
-
-4. **Reset and retry:**
-
-```bash
-# Clear state and start fresh
-rm .claude/hooks/stop-hook-state-*.json
-rm .claude/hooks/review-results-*.json  # File mode only
-```
-
-## Agents Not Spawning
-
-### Problem: Review instructions appear but no agents spawn
-
-**Symptoms:**
-- Instructions printed but Claude doesn't launch agents
-- "Spawn N Task agents" message but no activity
-
-**Solutions:**
-
-1. **Claude might not understand instructions:**
-
-The hook returns instructions telling Claude to spawn agents. If Claude doesn't comply, try:
-
-- Making changes more significant (trigger higher tier)
-- Manually asking: "Please run the review agents as instructed"
-
-2. **Check agent definitions:**
-
-Verify agents are defined in `AGENT_DEFINITIONS`:
-
-```python
-# All agents in AGENT_IDS must exist in AGENT_DEFINITIONS
-AGENT_IDS = {
-    "quick": ["explore_haiku"],  # Must have AGENT_DEFINITIONS["explore_haiku"]
-}
-```
-
-3. **Increase timeout:**
-
-In `.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 60000
-    }]
-  }
-}
-```
+Results are read at the next stop before any diff check. Stale results files are deleted after 24 hours.
 
 ## False Positives
 
-### Problem: Agents flag non-issues as violations
+**Symptoms:** the reviewer reports issues that are not real, reviews fail on valid code, excessive retries.
 
-**Symptoms:**
-- Agents report issues that aren't real problems
-- Review fails on valid code
-- Excessive retries
+1. **Tune the checklist.** Put your project's real rules in `review_checklist_file`, and tell the reviewer what not to flag. The file replaces the default, so it is the main control over review quality.
+2. **Raise tier thresholds** so small changes are skipped:
 
-**Solutions:**
-
-1. **Adjust agent checks:**
-
-Make checks more specific in `AGENT_DEFINITIONS`:
-
-```python
-AGENT_DEFINITIONS["explore_haiku"]["checks"] = "critical bugs only, ignore style issues"
+```json
+{ "tier_thresholds": {"skip": 1000, "quick": 8000, "standard": 25000} }
 ```
 
-2. **Increase tier thresholds:**
+3. **Exclude paths:**
 
-Skip review for more changes:
-
-```python
-TIER_THRESHOLDS = {
-    "skip": 2000,    # Was 500
-    "quick": 5000,   # Was 3000
-    "standard": 20000,  # Was 15000
-}
+```json
+{ "+excluded_paths": ["/tests/", "/scripts/"] }
 ```
 
-3. **Exclude problematic paths:**
+4. **Reduce retry limits:**
 
-```python
-EXCLUDED_PATHS = [
-    "/tests/",  # Skip test code
-    "/scripts/",  # Skip utility scripts
-]
+```json
+{ "max_fail_retries": 1 }
 ```
 
-4. **Reduce retry limit:**
+5. **Use report-only for deep reviews:** `"deep_auto_fix": "none"`.
 
-Don't get stuck in retry loops:
-
-```python
-MAX_FAIL_RETRIES = 1  # Was 3
-```
+Note that fixes made by the fix agent are not re-reviewed by the hook, so a wrong fix is not caught automatically.
 
 ## Performance Issues
 
-### Problem: Reviews take too long or slow down workflow
+Every review round is one foreground reviewer agent, so the cost is that agent's run time and tokens.
 
-**Symptoms:**
-- Hook takes >30 seconds
-- Frequent review interruptions
-- Claude feels sluggish
-
-**Solutions:**
-
-1. **Optimize tier thresholds:**
-
-Skip more small changes:
-
-```python
-TIER_THRESHOLDS = {
-    "skip": 1000,   # Skip more
-    "quick": 8000,
-    "standard": 25000,
-}
-```
-
-2. **Use faster agents:**
-
-Replace Sonnet with Haiku:
-
-```python
-AGENT_IDS = {
-    "standard": ["explore_haiku", "general_haiku"],  # No bug_hunter (Sonnet)
-    "deep": ["explore_haiku", "general_haiku", "general_haiku"],  # No general_sonnet
-}
-```
-
-3. **Reduce agent count:**
-
-```python
-AGENT_IDS = {
-    "quick": ["explore_haiku"],
-    "standard": ["explore_haiku"],  # Was 3 agents
-    "deep": ["explore_haiku", "general_haiku"],  # Was 4 agents
-}
-```
-
-4. **Increase auto-continue limit:**
-
-```python
-MAX_AUTO_CONTINUES = 10  # Was 3 - less frequent stops
-```
-
+1. **Use a faster model:** `{ "reviewer_model": "sonnet" }` (the `minimal` preset does this).
+2. **Skip more small changes:** raise `tier_thresholds`.
+3. **Fewer interruptions:** raise `max_auto_continues`, or use the `relaxed` preset.
+4. **Check what you added.** Every extra agent in `agent_ids` runs for each round of its tier. The default is just `reviewer`.
 5. **Profile with metrics:**
 
 ```bash
-# Find slowest reviews
-jq 'select(.tier == "deep")' .claude/hooks/stop-hook-metrics.jsonl | head -5
+jq 'select(.tier == "deep")' .claude/hooks/state/stop-hook-metrics.jsonl | head -5
 ```
 
 ## State File Issues
 
-### Problem: State file corruption or accumulation
+All state lives in `.claude/hooks/state/`.
 
-**Symptoms:**
-- `stop-hook-state.json` has wrong format
-- State not resetting between sessions
-- Old state interfering with new work
-
-**Solutions:**
-
-1. **Validate state file:**
+**Reset state:**
 
 ```bash
-# Check if valid JSON
-jq empty .claude/hooks/stop-hook-state.json && echo "Valid" || echo "Invalid"
+rm .claude/hooks/state/stop-hook-state-*.json
 ```
 
-2. **Reset state manually:**
-
-```bash
-rm .claude/hooks/stop-hook-state-*.json
-```
-
-3. **Check staleness timeout:**
-
-State expires after 1 hour by default. Adjust if needed:
-
-```python
-STATE_EXPIRY = 7200  # 2 hours instead of 1
-```
-
-4. **Clean up old files:**
-
-```bash
-# Remove all state files
-rm .claude/hooks/stop-hook-state-*.json
-
-# Remove results files (file mode only)
-rm .claude/hooks/review-results-*.json
-```
-
-**Note:** In inline mode (default), review results are embedded in the transcript, not stored in separate files. Only state files need cleanup.
+- A corrupt state file is a hard error (see [Hook Error](#hook-error---code-review-did-not-run)); delete it as above.
+- State older than `state_expiry` (3600 s) is treated as stale: the diff baseline is kept and review counters are reset.
+- Starting a new Claude session (new transcript path) starts a fresh state file.
+- State, prompt and results files older than 24 hours are removed automatically.
 
 ## Module Boundary Errors
 
-### Problem: Module boundary violations not detected or wrong
+1. **Config file location.** It must be `.claude/review-config.json`, one level above the hooks directory, not inside `.claude/hooks/`.
+2. **JSON validity.** Invalid JSON is a fail-loud error: `jq empty .claude/review-config.json`.
+3. **Module detection.** The module is the first path segment: `api/routes/users.py` is module `api`; `main.py` has no module and is skipped.
+4. **What is checked.** `from <forbidden>` and `import <forbidden>` in the code preview of the change; only `forbidden_imports` and `communication` are used. `allowed_imports` is not enforced.
+5. **How violations appear.** They are given to the reviewer as extra focus; they are not blocked by the hook itself.
 
-**Symptoms:**
-- Forbidden imports not caught
-- Violations reported for valid imports
-- Configuration ignored
+## Upgrading from 2.x
 
-**Solutions:**
+3.0.0 is a breaking release. A 2.x `hook-overrides.json` fails loud until it is updated:
 
-1. **Verify config file location:**
+| 2.x | 3.0.0 |
+|-----|-------|
+| `agent_ids` with `explore_haiku`, `general_haiku`, `bug_hunter`, `integration_checker`, `general_opus` | Remove them. One `reviewer` per tier; custom agents via `extra_agent_definitions` |
+| `subagent_timeout` | Removed (reviews run in the foreground) |
+| Review model fixed per agent | `reviewer_model`, `fixer_model` |
+| Generic checks inside the package | `review_checklist_file` |
+| Files in `.claude/hooks/` | Files in `.claude/hooks/state/`; add `.claude/hooks/state/` to `.gitignore` |
 
-Must be at `.claude/review-config.json` (one level up from hooks):
-
-```bash
-# Should exist
-ls -la .claude/review-config.json
-
-# NOT here
-ls -la .claude/hooks/review-config.json  # Wrong location
-```
-
-2. **Check JSON format:**
-
-```bash
-# Validate JSON
-jq empty .claude/review-config.json && echo "Valid" || echo "Invalid"
-```
-
-3. **Review module path detection:**
-
-The hook determines module from the first path segment:
-
-```
-api/routes/users.py  → module = "api"
-services/auth/service.py  → module = "services"
-main.py  → no module (skipped)
-```
-
-Ensure your project structure matches config:
-
-```json
-{
-  "module_boundaries": {
-    "api": { ... },       // Matches api/
-    "services": { ... }   // Matches services/
-  }
-}
-```
-
-4. **Check import pattern detection:**
-
-The hook looks for these patterns in code hunks:
-
-```python
-from services import something  # Detected
-import services.auth           # Detected
-import services                 # Detected
-```
-
-But not:
-
-```python
-# from services import x  # Commented out - not detected
-```
+Old `stop-hook-*.json`, `review-*` files and logs in `.claude/hooks/` are no longer used and can be deleted. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Debug Mode
 
-### Enable Maximum Verbosity
+```bash
+tail -f .claude/hooks/state/stop-hook-debug.log
+```
 
-1. **Check debug log:**
+Test with a real transcript:
 
 ```bash
-tail -f .claude/hooks/stop-hook-debug.log
+echo '{"transcript_path": "/path/to/real/transcript.jsonl"}' | python .claude/hooks/stop-design-audit.py
 ```
 
-2. **Add custom logging:**
-
-Edit `stop-design-audit.py` and add logs anywhere:
-
-```python
-log(f"Custom debug: {variable_name}")
-```
-
-3. **Test with sample input:**
-
-```bash
-cat > test-input.json << 'EOF'
-{
-  "transcript_path": "/path/to/real/transcript.jsonl",
-  "cwd": "/path/to/project"
-}
-EOF
-
-cat test-input.json | python .claude/hooks/stop-design-audit.py
-```
-
-## Common Error Messages
-
-### "Transcript file not found"
-
-**Cause:** Invalid transcript path in input
-**Fix:** Check that Claude Code is passing correct path (usually not user error)
-
-### "JSON decode error reading results file"
-
-**Cause:** Race condition - Claude is still writing results
-**Fix:** Hook retries automatically, no action needed
-
-### "No transcript_path in input"
-
-**Cause:** Hook called without proper input
-**Fix:** Hook must be triggered by Claude Code, not manually (unless testing)
-
-### "State file is malformed JSON"
-
-**Cause:** Corruption or interrupted write
-**Fix:** Delete state file and restart
-
-### "No results markers found in transcript" (inline mode)
-
-**Cause:** Claude didn't output results with the expected markers
-**Fix:**
-- Verify agents were spawned and completed
-- Check that Claude is following instructions to output markers
-- Review transcript for partial or malformed output
-
-### "Permission denied writing review-results" (file mode)
-
-**Cause:** Missing file write permission
-**Fix:** Add to `.claude/settings.local.json`:
-```json
-{
-  "permissions": {
-    "allow": ["Write(.claude/hooks/review-results-*.json)"]
-  }
-}
-```
+Force a tier while testing: `CLAUDE_HOOK_FORCE_TIER=deep` (values `quick`, `standard`, `deep`).
 
 ## Getting Help
-
-If you're still stuck:
 
 1. **Gather debug info:**
 
 ```bash
-# Collect all relevant files
 mkdir debug-info
-cp .claude/hooks/stop-hook-*.log debug-info/
-cp .claude/hooks/stop-hook-*.json debug-info/
-cp .claude/settings.json debug-info/
+cp .claude/hooks/state/stop-hook-debug.log .claude/hooks/state/stop-hook-metrics.jsonl debug-info/
+cp .claude/hooks/state/stop-hook-state-*.json debug-info/
+cp .claude/hooks/hook-overrides.json .claude/settings.json debug-info/
 cp .claude/review-config.json debug-info/ 2>/dev/null || true
 ```
 
-2. **Check hook version:**
-
-```bash
-head -20 .claude/hooks/stop-design-audit.py | grep "Claude Code Stop Hook"
-```
-
-3. **Open an issue:**
-
-Include:
-- Debug logs
-- Configuration files
-- Description of problem
-- Steps to reproduce
-
-## Performance Benchmarks
-
-Expected performance (typical laptop):
-
-- **Skip tier:** <100ms (no agents)
-- **Quick tier:** 2-5 seconds (1 Haiku agent)
-- **Standard tier:** 5-15 seconds (3 agents, 1 Sonnet)
-- **Deep tier:** 10-30 seconds (4 agents, 2 Sonnet)
-
-If your times are significantly higher:
-- Check agent definitions (too complex instructions?)
-- Reduce parallel agents
-- Increase tier thresholds
-- Consider API mode for faster startup
+2. **Hook version:** every metrics record contains `version` and `config_fingerprint`.
+3. **Open an issue** with the debug log, configuration files, a description of the problem and steps to reproduce.
 
 ## Known Limitations
 
-1. **Context Window:** Very large diffs (>100K chars) may exceed agent context
-2. **Binary Files:** Can't review binary file changes (but these are excluded)
-3. **Git Conflicts:** Hook doesn't understand merge conflict markers
-4. **External Deps:** Can't verify correctness of external library usage
-5. **Runtime Behavior:** Only reviews static code, not runtime behavior
+1. **Context window:** very large diffs may exceed what the reviewer can read in one pass.
+2. **Subagent fixes are not re-reviewed:** the hook only sees edits made in the main session transcript.
+3. **Binary and excluded files:** not reviewed.
+4. **Git conflicts:** conflict markers are not understood.
+5. **Runtime behavior:** only static code is reviewed.

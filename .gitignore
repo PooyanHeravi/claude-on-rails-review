@@ -1,9 +1,15 @@
 # =============================================================================
 # Claude on Rails Review - Runtime State Files
 # =============================================================================
-# These are created during hook execution and should never be committed
+# These are created during hook execution and should never be committed.
+# As of 3.0.0 all of them live in <hooks_dir>/state/.
+/state/
+.claude/hooks/state/
+# Pre-3.0.0 locations (files written next to the hook)
 stop-hook-state-*.json
 review-results-*.json
+review-prompt-*.md
+coordinator-instructions-*.json
 stop-hook-debug.log
 stop-hook-metrics.jsonl
 
@@ -164,8 +170,5 @@ site/
 # =============================================================================
 # Claude Code specific (when using this repo AS a project)
 # =============================================================================
-# Uncomment these if using Claude on Rails Review in another project
-# .claude/hooks/stop-hook-state-*.json
-# .claude/hooks/review-results-*.json
-# .claude/hooks/stop-hook-debug.log
-# .claude/hooks/stop-hook-metrics.jsonl
+# In a project that uses this hook, ignore the runtime directory:
+# .claude/hooks/state/

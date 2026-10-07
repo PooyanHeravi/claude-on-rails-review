@@ -2,36 +2,35 @@
 
 **Smart tiered code review hook for Claude Code**
 
-Keep Claude on the rails with automated, incremental code review that scales with the size of your changes. Designed to catch issues early without interrupting your flow for small changes.
+A Claude Code `Stop` hook that reviews what Claude changed before it is allowed to stop. Review effort scales with the size of the change, only changes since the last review are examined, and every failure of the hook itself is reported loudly instead of being swallowed.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](CHANGELOG.md)
 
-## ✨ Features
+## Features
 
-- **🎯 Tiered Reviews** - Review depth scales automatically with change size
-- **📊 Incremental Tracking** - Only reviews changes since last hook firing
-- **🤖 Multi-Agent Coordination** - Spawns specialized agents in parallel
-- **🔄 Session Persistence** - Per-session state tracking across stops
-- **🎨 Context-Aware** - Specialized checks for API routes, proto files, databases
-- **📈 Metrics Logging** - Track review outcomes over time
-- **⚡ Integration Detection** - Extra scrutiny when changes span modules
-- **🛡️ Module Boundaries** - Enforces architectural constraints (optional)
-- **🧠 Context Restoration** - Remembers what Claude was doing before review
-- **🔧 Subagent Fixes** - Fixes run in a subagent, preserving main context
-- **⚡ Deep Auto-Fix** - Configurable severity threshold for auto-fixing deep review issues
+- **Tiered reviews** - the tier (skip, quick, standard, deep) is chosen from the size of the change and sets how hard the reviewer digs
+- **One reviewer** - a single foreground reviewer agent per round; the tier scales effort, not agent count
+- **Incremental tracking** - only changes since the last hook firing are reviewed
+- **Your checklist** - built-in generic checklist, or replace it with a project file (`review_checklist_file`)
+- **Context-aware focus** - extra focus for proto, database, API route, gRPC service and frontend files, for cross-module changes, and for files with earlier findings in the session
+- **Strict results contract** - the reviewer writes a JSON file the hook validates; missing or invalid results are re-requested once, then reported as UNREVIEWED
+- **Fail loud** - invalid config, a missing transcript or corrupt state produce a visible error, never a silent allow
+- **Provenance** - every metrics record carries the hook version and a config fingerprint
+- **Module boundaries** - optional enforcement of forbidden imports between top-level directories
+- **Fixes by a subagent** - fixes run in a separate agent (`fixer_model`), preserving the main context
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Install the Hook
 
-The hook is a `stop_design_audit/` Python package plus a `stop-design-audit.py` shim that imports it. The easiest way to install is to run the bundled script from this repo's root:
+The hook is a `stop_design_audit/` Python package plus a `stop-design-audit.py` shim. Run the bundled installer from this repo's root:
 
 ```bash
 bash install.sh
 ```
 
-Or install manually — both the shim and the package must live in the same directory:
+Or install manually. Both the shim and the package must live in the same directory:
 
 ```bash
 mkdir -p .claude/hooks
@@ -45,113 +44,157 @@ Add to `.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "stop": [{
-      "command": "python .claude/hooks/stop-design-audit.py",
-      "timeout": 30000
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python .claude/hooks/stop-design-audit.py",
+        "timeout": 30
+      }]
     }]
   }
 }
 ```
 
-### 3. Start Coding
+### 3. Ignore the Runtime Directory
 
-The hook runs automatically when Claude tries to stop. It will:
-- ✅ Skip review for tiny changes (<500 chars, 1 file)
-- 🔍 Quick review for small changes (500-5000 chars, ≤3 files)
-- 🔬 Standard review for medium changes (5000-20000 chars, ≤6 files)
-- 🏗️ Deep review for large changes (≥20000 chars or >6 files)
+All runtime files live in `.claude/hooks/state/`. Add it to your project's `.gitignore`:
 
-## 📋 How It Works
+```
+.claude/hooks/state/
+```
 
-### Tier System
+### 4. Start Coding
 
-| Tier | Threshold | Files | Agents | Description |
-|------|-----------|-------|--------|-------------|
-| **skip** | <500 chars | 1 file | 0 | No review needed |
-| **quick** | 500-5K chars | ≤3 files | 1 | Lightweight check |
-| **standard** | 5K-20K chars | ≤6 files | 3 | Standard review |
-| **deep** | ≥20K chars | >6 files | 4 | Comprehensive audit |
+The hook runs when Claude tries to stop and picks a tier from the incremental change:
 
-### Agent Roles
+| Tier | Incremental change | Action |
+|------|--------------------|--------|
+| **skip** | <500 chars and 1 file | No review |
+| **quick** | <5000 chars and <=3 files | One reviewer, focused pass |
+| **standard** | <20000 chars and <=6 files | One reviewer, reads every changed file |
+| **deep** | anything larger | One reviewer, exhaustive pass |
 
-- **explore_haiku** - Fast scan for obvious issues, hardcoded values
-- **general_haiku** - Silent failures, missing validation, security
-- **bug_hunter** - Race conditions, resource leaks, edge cases (Default: Sonnet)
-- **general_sonnet** - Architecture, service boundaries (Default: Sonnet)
-- **integration_checker** - Cross-module consistency (added dynamically, Default: Opus)
+A tier needs to fit BOTH its character threshold and its file limit. Thresholds are configurable ([CONFIGURATION.md](CONFIGURATION.md)).
 
-### Auto-Continue Logic
+## How It Works
 
-The hook allows Claude to continue automatically up to **3 successful review passes** per session before requiring manual approval. This keeps you in flow while maintaining code quality.
+```
+Claude tries to stop
+        |
+        v
+  Hook reads transcript, computes incremental diff, picks tier
+        |
+        +-- skip tier ------------------------> allow / auto-continue
+        |
+        v
+  Hook writes  state/review-prompt-<session>-<round>-reviewer.md
+  Hook BLOCKS: "run the reviewer (foreground Agent call)"
+        |
+        v
+  Reviewer (agent "reviewer", model = reviewer_model) reads the prompt,
+  reviews the changed files, writes
+        state/review-results-<session>-<round>-reviewer.json
+        |
+        v
+  Claude tries to stop again -> hook reads the results FIRST
+        |
+        +-- pass ----> "Design audit passed ... Continue."  (auto-continue)
+        +-- fail ----> issues listed; a fix agent (fixer_model) fixes them
+        +-- missing / invalid results -> re-requested once,
+                                         then an UNREVIEWED warning
+```
 
-## ⚙️ Configuration
+The reviewer runs in the **foreground** (`run_in_background=false`) in the main session. There is no background orchestrator and no transcript marker parsing in subagent mode.
 
-Core defaults live in [`stop_design_audit/config.py`](stop_design_audit/config.py). For project-specific overrides without editing the package, create `.claude/hooks/hook-overrides.json` (see [`hook-overrides.example.json`](hook-overrides.example.json)):
+### The Reviewer
 
-### Tier Thresholds
+The default agent id is `reviewer`. Its model comes from `reviewer_model` (default `opus`). Its prompt contains the effort instruction for the tier, the checklist, extra focus for this change, the changed files and code previews from the transcript.
 
-```python
-TIER_THRESHOLDS = {
-    "skip": 500,       # Characters
-    "quick": 5000,
-    "standard": 20000,
+Extra focus is added when:
+
+- changed files match a context: `proto`, `database`, `api_routes`, `grpc_service`, `frontend`
+- the change spans 2+ top-level directories, or touches 2+ `critical_patterns` (cross-module context is passed to the reviewer as focus; no extra agent is spawned)
+- a module-boundary violation is detected
+- a file already had findings earlier in the session
+
+### Checklist
+
+By default the reviewer uses the built-in checklist (silent failures, correctness, contracts and integration, security, hardcoding, tests). Set `review_checklist_file` to a project file to **replace** it. See [CONFIGURATION.md](CONFIGURATION.md#review-checklist).
+
+### Results Contract
+
+The reviewer must write exactly this shape to its results file:
+
+```json
+{
+  "round_id": "a3f8d921",
+  "agent_id": "reviewer",
+  "status": "pass",
+  "issues": [
+    {
+      "file": "api/routes/users.py",
+      "line": 42,
+      "severity": "high",
+      "category": "silent-failure",
+      "description": "what is wrong and the concrete failure it causes"
+    }
+  ]
 }
+```
 
-TIER_FILE_LIMITS = {
-    "skip": 1,         # File count
-    "quick": 3,
-    "standard": 6,
+The hook rejects the file (no repair, no partial acceptance) unless it is valid JSON, `round_id` and `agent_id` match the round, `status` is `pass` or `fail`, every issue has `file` (string), `line` (integer or `null`), `severity` (`critical`, `high`, `medium`, `low`), `category` and `description` (strings), and `status` is `fail` whenever there is a critical issue or two or more high issues.
+
+### After a Review
+
+- **Pass** - Claude is told to continue (`[Auto-continue N of 3]`). Non-blocking findings are passed on to the user. After `max_auto_continues` passes Claude may stop.
+- **Fail** - the issues are listed. For quick and standard tiers every issue is sent to ONE fix agent (`fixer_model`, default `sonnet`). For the deep tier `deep_auto_fix` sets the minimum severity to fix; `none` means report only. Issues below the threshold are reported, not fixed.
+- **Fixes are not re-reviewed.** Edits made by a subagent do not appear in the main session transcript, so the hook cannot see them.
+- **Unreviewed** - if the results file is missing or invalid, the hook asks again once (`max_review_attempts` = 2 attempts in total). If that also fails, the user sees a warning that the changes are UNREVIEWED.
+
+### Fail Loud
+
+Configuration and hook errors are never swallowed. On an invalid config (unknown key, wrong type or enum value, bad JSON, unknown preset, missing checklist file, undefined agent, invalid `CLAUDE_HOOK_*` value), a missing transcript, a corrupt state file, or any unexpected exception, the hook shows the user a `systemMessage` ("hook error — code review did NOT run: ...") and blocks once so Claude relays it. If that stop is already a hook-forced continuation (`stop_hook_active`), it only warns, so it can never loop. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+## Configuration
+
+Defaults live in [`stop_design_audit/config.py`](stop_design_audit/config.py). Project overrides go in `.claude/hooks/hook-overrides.json` (see [`hook-overrides.example.json`](hook-overrides.example.json)). The file is validated on every run:
+
+```json
+{
+  "preset": "balanced",
+  "reviewer_model": "opus",
+  "fixer_model": "sonnet",
+  "review_checklist_file": "review-checklist.md",
+  "+critical_patterns": ["/api/", "/models/", "/migrations/"],
+  "+excluded_paths": ["/docs/", "/examples/"]
 }
 ```
 
-### Auto-Continue Settings
+Presets: `strict`, `balanced` (defaults), `relaxed`, `minimal`. Merge order: defaults, preset, explicit keys, environment variables. See [CONFIGURATION.md](CONFIGURATION.md) for every key.
 
-```python
-MAX_AUTO_CONTINUES = 3    # How many passes before stopping
-MAX_FAIL_RETRIES = 3      # Retries before giving up
-STATE_EXPIRY = 3600       # Session timeout (seconds)
-```
+### Environment Variables
 
-### Critical Patterns
+| Variable | Values | Effect |
+|----------|--------|--------|
+| `CLAUDE_HOOK_SKIP` | `0`, `1` | `1` disables the hook for this run |
+| `CLAUDE_HOOK_FORCE_TIER` | `quick`, `standard`, `deep` | Force a tier |
+| `CLAUDE_HOOK_DEEP_AUTO_FIX` | `none`, `critical`, `high`, `medium`, `all` | Override `deep_auto_fix` |
+| `CLAUDE_HOOK_REVIEW_MODE` | `subagent`, `agent`, `delegated`, `api` | Override `review_mode` |
 
-Changes matching these patterns trigger deeper review. **Customize for your project!**
+Any other value for these is a config error and fails loud, even when `CLAUDE_HOOK_SKIP=1`.
 
-```python
-# IMPORTANT: Replace with patterns for YOUR codebase!
-CRITICAL_PATTERNS = [
-    # Examples - uncomment/modify for your project:
-    # "/api/", "/routes/", "/models/", "/migrations/"
-]
-```
+### Module Boundaries (Optional)
 
-### Excluded Paths
-
-Skip review for these paths:
-
-```python
-EXCLUDED_EXTENSIONS = {".json", ".md", ".txt", ".yml", ".lock"}
-EXCLUDED_PATHS = ["/tests/fixtures/", "/node_modules/", "/.venv/"]
-```
-
-## 🎨 Module Boundaries (Optional)
-
-Create `.claude/review-config.json` to enforce architectural boundaries:
+Create `.claude/review-config.json` (one level above the hooks directory):
 
 ```json
 {
   "module_boundaries": {
     "api": {
-      "allowed_imports": ["core"],
       "forbidden_imports": ["services", "internal"],
       "communication": "Must use gRPC to communicate with services"
     },
-    "services": {
-      "allowed_imports": ["core"],
-      "forbidden_imports": ["api", "frontend"],
-      "communication": "Use gRPC for inter-service communication"
-    },
     "frontend": {
-      "allowed_imports": [],
       "forbidden_imports": ["api", "services"],
       "communication": "Must use REST API only"
     }
@@ -159,181 +202,94 @@ Create `.claude/review-config.json` to enforce architectural boundaries:
 }
 ```
 
-The hook will detect cross-boundary imports in code changes and flag violations.
+The module is the first path segment of a changed file. Violations (`from <module>` / `import <module>` of a forbidden module in the change preview) are given to the reviewer as extra focus. The optional `force_tier` key (`quick`, `standard`, `deep`) forces a tier.
 
-## 📊 Metrics & Debugging
+## Runtime Files and Metrics
 
-The hook generates state files in `.claude/hooks/`:
+Everything the hook writes goes to `.claude/hooks/state/`. Configuration stays in `.claude/hooks/`.
 
-- **`stop-hook-state-{hash}.json`** - Session state (counters, positions)
-- **`stop-hook-debug.log`** - Debug output
-- **`stop-hook-metrics.jsonl`** - Review metrics (JSONL format)
-- **`review-results-{hash}.json`** - Agent results (file mode only, see Results Mode below)
+| File | Contents |
+|------|----------|
+| `stop-hook-state-<session>.json` | Session state (counters, round, pending review) |
+| `review-prompt-<session>-<round>-<agent>.md` | Prompt the reviewer reads |
+| `review-results-<session>-<round>-<agent>.json` | Results the reviewer writes |
+| `stop-hook-debug.log` | Debug log (truncated above 1 MB) |
+| `stop-hook-metrics.jsonl` | One JSON record per review round (last 5000 kept) |
 
-### Analyzing Metrics
+State, prompt and results files older than 24 hours are deleted automatically. `<session>` is a 12-character hash of the transcript path.
+
+A metrics record:
+
+```json
+{"timestamp": "2026-10-07T15:20:11", "version": "3.0.0", "config_fingerprint": "9f2c...", "tier": "standard", "diff_chars": 8547, "file_count": 5, "agents": ["reviewer"], "outcome": "pass", "fail_count": 0, "session_id": "a6277e24"}
+```
+
+`session_id` is the first 8 characters of the session hash. Outcomes: `pass`, `fail`, `invalid_results`, `abandoned`, `scavenged_pass`, `scavenged_fail`.
 
 ```bash
-# Count reviews by tier
-jq -r .tier .claude/hooks/stop-hook-metrics.jsonl | sort | uniq -c
+# Reviews by tier
+jq -r .tier .claude/hooks/state/stop-hook-metrics.jsonl | sort | uniq -c
 
-# Average diff size by outcome
-jq -s 'group_by(.outcome) | map({outcome: .[0].outcome, avg_diff: (map(.diff_chars) | add / length)})' .claude/hooks/stop-hook-metrics.jsonl
-
-# Pass rate
-jq -s '[.[] | .outcome] | group_by(.) | map({outcome: .[0], count: length})' .claude/hooks/stop-hook-metrics.jsonl
+# Outcomes
+jq -s '[.[] | .outcome] | group_by(.) | map({outcome: .[0], count: length})' .claude/hooks/state/stop-hook-metrics.jsonl
 ```
 
-## 🛠️ Advanced Usage
+### Permissions
 
-### Results Mode
-
-Choose how review results are delivered:
-
-```python
-RESULTS_MODE = "inline"  # Default - no extra permissions needed
-# or
-RESULTS_MODE = "file"    # Write to JSON file - requires permission
-```
-
-**Inline mode (default):** Claude outputs results with markers in its response. The hook parses the transcript to extract results. No file write permissions needed.
-
-**File mode:** Claude writes results to `.claude/hooks/review-results-{hash}.json`. Requires adding to `.claude/settings.local.json`:
+The reviewer writes its results file with the Write tool. To avoid a permission prompt, allow it in `.claude/settings.local.json`:
 
 ```json
 {
   "permissions": {
-    "allow": ["Write(.claude/hooks/review-results-*.json)"]
+    "allow": ["Write(.claude/hooks/state/review-results-*.json)"]
   }
 }
 ```
 
-### API Mode (Fallback)
+## Other Review Modes
 
-If you prefer direct API calls over subagents:
+`review_mode` also accepts `agent`, `delegated` and `api` (the last needs `ANTHROPIC_API_KEY`). They are kept for compatibility and are not covered in the main guides; the default is `subagent`. The `results_mode` key applies to `agent` and `delegated` only.
 
-```python
-REVIEW_MODE = "api"  # Change from "agent"
-API_DIFF_THRESHOLD = 500  # Haiku below, Sonnet above
-```
+## FAQ
 
-Requires `ANTHROPIC_API_KEY` environment variable.
+**Will this slow down my workflow?**
+Changes under 500 characters in one file skip review. Every other tier runs one reviewer agent, so the time cost is one foreground agent call.
 
-### Custom Agent Definitions
+**What happens after 3 auto-continues?**
+Claude is allowed to stop. Set `max_auto_continues` to change it.
 
-Modify `AGENT_DEFINITIONS` to customize checks:
+**Can I disable the hook temporarily?**
+Set `CLAUDE_HOOK_SKIP=1`, or remove the hook from `.claude/settings.json`.
 
-```python
-AGENT_DEFINITIONS = {
-    "explore_haiku": {
-        "subagent_type": "Explore",
-        "model": "haiku",
-        "checks": "your custom checks here",
-        "context_checks": {
-            "proto": "proto-specific checks",
-        }
-    },
-}
-```
+**Can I use a different model for the review?**
+Yes: `reviewer_model` (default `opus`) and `fixer_model` (default `sonnet`). The `minimal` preset sets `reviewer_model` to `sonnet`.
 
-### Integration with CI/CD
+**Can I add my own reviewers?**
+Yes, with `extra_agent_definitions` plus `agent_ids`; see [CONFIGURATION.md](CONFIGURATION.md#custom-agents). The default is a single reviewer.
 
-The hook can be used in CI/CD pipelines:
+**How do I reset session state?**
+Delete `.claude/hooks/state/stop-hook-state-*.json`.
 
-```bash
-# Pass transcript path as stdin
-echo '{"transcript_path": "/path/to/transcript.jsonl"}' | python stop-design-audit.py
-```
-
-## 🤔 FAQ
-
-**Q: Will this slow down my workflow?**
-A: No! Small changes (<500 chars) skip review entirely. Quick reviews use fast Haiku agents.
-
-**Q: What happens after 3 auto-continues?**
-A: Claude stops and waits for your manual approval before continuing.
-
-**Q: Can I disable the hook temporarily?**
-A: Yes, set `CLAUDE_HOOK_SKIP=1` in your environment, remove the hook from `.claude/settings.json`, or set `MAX_AUTO_CONTINUES = 999`.
-
-**Q: Can deep reviews auto-fix issues instead of stopping?**
-A: Yes! Set `DEEP_AUTO_FIX = "high"` (or `"critical"`, `"medium"`, `"all"`) to auto-fix issues at or above that severity. Override with `CLAUDE_HOOK_DEEP_AUTO_FIX` env var.
-
-**Q: Does Claude lose context after a review?**
-A: Not anymore. The hook extracts the last user request and recent tool actions from the transcript and includes them in the resume instruction.
-
-**Q: Does this work with custom skills?**
-A: Yes! The hook is skill-agnostic and works with any Claude Code workflow.
-
-**Q: How do I reset session state?**
-A: Delete `.claude/hooks/stop-hook-state-*.json` to start fresh.
-
-**Q: What's the difference between inline and file mode?**
-A: Inline mode (default) requires no extra permissions - results are embedded in Claude's response with markers. File mode writes results to a JSON file but requires adding write permissions to `settings.local.json`.
-
-## 📚 Documentation
+## Documentation
 
 - **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes
+- **[SETUP.md](SETUP.md)** - Structured install guide and override key reference
 - **[CONFIGURATION.md](CONFIGURATION.md)** - Complete configuration reference
-- **[EXAMPLES.md](EXAMPLES.md)** - Real-world configuration examples
+- **[EXAMPLES.md](EXAMPLES.md)** - Real-world `hook-overrides.json` examples
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Common issues and solutions
+- **[CHANGELOG.md](CHANGELOG.md)** - Release notes
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines
 
-## 📝 Example Output
+## Contributing
 
-```
-QUICK_REVIEW: +1847 chars, 2 files across 1 module(s) [Round: a3f8d921]
+Contributions are welcome. For major changes, please open an issue first.
 
-Spawn 1 Task agent:
-
-1. subagent_type='Explore', model='haiku' [ID: explore_haiku]
-   Check: code smells, obvious bugs, hardcoded values, missing error handling
-
-Files:
-  api/
-    - routes/users.py
-    - utils/validation.py
-
-[Auto-continue 1 of 3] If no issues found, continue with implementation.
-```
-
-**Results output (inline mode - default):**
-```
-<!--REVIEW_RESULTS_START-->
-{
-  "round_id": "a3f8d921",
-  "agents": {
-    "explore_haiku": {
-      "status": "pass",
-      "issues": []
-    }
-  }
-}
-<!--REVIEW_RESULTS_END-->
-```
-
-**Results output (file mode):**
-```
-IMPORTANT: After ALL agents complete, write results to .claude/hooks/review-results-a3f8d921.json
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-## 📄 License
+## License
 
 MIT License - see LICENSE file for details.
 
-## 🙏 Credits
-
-Created for the Claude Code community. Inspired by Ruby on Rails conventions and the need for intelligent, non-intrusive code review.
-
-## 🔗 Links
+## Links
 
 - [Claude Code Documentation](https://code.claude.com/docs)
 - [Claude Code Hooks Guide](https://code.claude.com/docs/en/hooks-guide)
 - [Issue Tracker](https://github.com/PooyanHeravi/claude-on-rails-review/issues)
-
----
-
-**Keep Claude on the rails! 🚂**
