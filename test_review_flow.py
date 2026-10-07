@@ -707,6 +707,95 @@ def test_completion_guard_warns_on_unreviewed_edits():
     return True
 
 
+FIELD_CORRUPTION_CASES = [
+    ("bad timestamp", {"timestamp": "not-a-date"}),
+    ("string counter", {"auto_continue_count": "3"}),
+    ("non-list files", {"last_files_seen": 7}),
+    ("bool as int", {"fail_count": True}),
+]
+
+
+def test_field_level_corruption_self_heals():
+    """[Live-round aeceec01 regression] Valid JSON with mistyped fields is quarantined once, not every stop."""
+    for label, bad in FIELD_CORRUPTION_CASES:
+        with hook_session() as (transcript, session_hash):
+            write_edit_transcript(transcript)
+            state = dispatch(transcript, session_hash)
+            if state is None:
+                return False
+            state_path = state_path_for(session_hash)
+            state.update(bad)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            code, stdout, _ = run_hook(transcript)
+            if code != 0 or not check_fail_loud(stdout, False, "corrupt state file moved to"):
+                return fail(f"{label}: must fail loud and quarantine")
+            if state_path.exists():
+                return fail(f"{label}: corrupt state should be moved aside")
+            # Next stop is clean (fresh state), not another failure
+            code, stdout, _ = run_hook(transcript)
+            if stdout and "hook error" in stdout:
+                return fail(f"{label}: second stop still fails: {stdout[:200]}")
+    print("  PASS: field-level corruption fails loud once, then self-heals")
+    return True
+
+
+def test_auto_continue_limit_warns_on_unreviewed_edits():
+    """[Live-round aeceec01 regression] The auto-continue-limit guard warns about new unreviewed edits."""
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        state = dispatch(transcript, session_hash)
+        if state is None:
+            return False
+        state.update(subagent_pending=False, round_id="", review_agents=[], auto_continue_count=3)
+        state_path_for(session_hash).write_text(json.dumps(state), encoding="utf-8")
+        write_transcript(transcript, [
+            edit_event("/test/file.py", "x" * 600),
+            edit_event("/test/other.py", "y" * 900),
+        ])
+        code, stdout, _ = run_hook(transcript, stop_hook_active=True)
+        if code != 0 or not stdout:
+            return fail(f"expected a visible warning, got code={code} stdout={stdout!r}")
+        output = json.loads(stdout)
+        if set(output) != {"systemMessage"} or "auto-continue limit reached" not in output["systemMessage"]:
+            return fail(f"limit guard must warn about unreviewed edits: {output}")
+    print("  PASS: auto-continue limit guard warns when it skips new edits")
+    return True
+
+
+def test_deep_completed_warns_on_unreviewed_edits():
+    """[Live-round aeceec01 regression] The deep-cycle-completed exit warns about new unreviewed edits."""
+    with hook_session() as (transcript, session_hash):
+        write_edit_transcript(transcript)
+        state = dispatch(transcript, session_hash)
+        if state is None:
+            return False
+        state.update(subagent_pending=False, round_id="", review_agents=[], completed=True, tier="deep")
+        state_path_for(session_hash).write_text(json.dumps(state), encoding="utf-8")
+        write_transcript(transcript, [
+            edit_event("/test/file.py", "x" * 600),
+            edit_event("/test/other.py", "y" * 900),
+        ])
+        code, stdout, _ = run_hook(transcript, stop_hook_active=True)
+        if code != 0 or not stdout:
+            return fail(f"expected a visible warning, got code={code} stdout={stdout!r}")
+        output = json.loads(stdout)
+        if set(output) != {"systemMessage"} or "deep review cycle completed" not in output["systemMessage"]:
+            return fail(f"deep-completed exit must warn about unreviewed edits: {output}")
+    print("  PASS: deep-completed exit warns when it skips new edits")
+    return True
+
+
+def test_input_error_log_is_written():
+    """[Live-round aeceec01 regression] An input error is logged to the log file the message cites."""
+    code, stdout, _ = run_hook(None, raw_input="this is not json")
+    output = json.loads(stdout)
+    log_path = output["systemMessage"].rsplit("(log: ", 1)[-1].rstrip(")")
+    if not Path(log_path).is_file() or "JSONDecodeError" not in Path(log_path).read_text(encoding="utf-8"):
+        return fail(f"cited log {log_path} must exist and contain the error")
+    print("  PASS: input errors land in the cited log")
+    return True
+
+
 LAYERS = [
     ("Regression tests (bugs fixed in 3.0.0)", [
         test_bug1_deep_cross_module_subagent_dispatch,
@@ -739,6 +828,12 @@ LAYERS = [
     ]),
     ("Design-audit review findings (round 13479109)", [
         test_completion_guard_warns_on_unreviewed_edits,
+    ]),
+    ("Live review findings (round aeceec01)", [
+        test_field_level_corruption_self_heals,
+        test_auto_continue_limit_warns_on_unreviewed_edits,
+        test_deep_completed_warns_on_unreviewed_edits,
+        test_input_error_log_is_written,
     ]),
 ]
 
