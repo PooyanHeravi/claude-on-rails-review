@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 3.1.0 — 2026-10-12
+
+### Added
+- **Reasoning effort per agent.** New keys `reviewer_effort` and `fixer_effort`, and an optional `effort` field on `extra_agent_definitions` entries. Allowed values: `low`, `medium`, `high`, `xhigh`, `max`, or `""`. A set value is passed to the Agent tool as `effort`. Empty (the default) leaves `effort` out of the call, so the harness default for that model applies. Before this, effort could only be suggested in prompt text, which does not change how hard the model reasons. Invalid values are config errors.
+
 ## 3.0.0 — 2026-10-07
 
 ### Breaking
@@ -191,6 +196,6 @@ Changes to these paths always trigger deep review:
 - `/proto/`
 - `/migrations/`
 
-[Unreleased]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v3.1.0...HEAD
 [2.0.0]: https://github.com/PooyanHeravi/claude-on-rails-review/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/PooyanHeravi/claude-on-rails-review/releases/tag/v1.0.0

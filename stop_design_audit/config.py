@@ -112,6 +112,11 @@ RESULTS_MODE = "inline"  # agent/delegated modes only; subagent mode always uses
 # =============================================================================
 REVIEWER_MODEL = "opus"
 FIXER_MODEL = "sonnet"
+# Agent tool reasoning effort. Empty = the call omits `effort`, so the harness
+# default for that model applies.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+REVIEWER_EFFORT = ""
+FIXER_EFFORT = ""
 # Path (relative to CONFIG_DIR, or absolute) of a project review checklist.
 # Empty = the package's built-in generic checklist.
 REVIEW_CHECKLIST_FILE = ""
@@ -260,6 +265,8 @@ _CONFIG_KEYS: dict[str, type] = {
     "deep_auto_fix": str,
     "reviewer_model": str,
     "fixer_model": str,
+    "reviewer_effort": str,
+    "fixer_effort": str,
     "review_checklist_file": str,
     "tier_thresholds": dict,
     "tier_file_limits": dict,
@@ -285,6 +292,8 @@ _ENUM_KEYS: dict[str, tuple[str, ...]] = {
     "review_mode": REVIEW_MODES,
     "results_mode": RESULTS_MODES,
     "deep_auto_fix": AUTO_FIX_LEVELS,
+    "reviewer_effort": ("",) + EFFORT_LEVELS,
+    "fixer_effort": ("",) + EFFORT_LEVELS,
 }
 
 # Keys that are metadata, not config values

@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Complete configuration reference for Claude on Rails Review 3.0.0.
+Complete configuration reference for Claude on Rails Review 3.1.0.
 
 ## Table of Contents
 
@@ -65,6 +65,7 @@ These are errors:
 - a wrong type, a negative number, or a boolean where an integer is expected
 - an invalid enum value for `review_mode`, `results_mode` or `deep_auto_fix`
 - an empty `reviewer_model` or `fixer_model`
+- a `reviewer_effort`, `fixer_effort` or custom agent `effort` that is not `low`, `medium`, `high`, `xhigh`, `max` or `""`
 - `tier_thresholds` / `tier_file_limits` that do not define exactly `skip`, `quick` and `standard`
 - `agent_ids` with an unknown tier (valid: `quick`, `standard`, `deep`) or an empty list
 - an unknown `preset`
@@ -83,6 +84,8 @@ The only keys that are not configuration values are `preset`, `extra_agent_defin
 | `review_mode` | string | `"subagent"` | `subagent`, `agent`, `delegated`, `api` |
 | `reviewer_model` | string | `"opus"` | Model of the built-in `reviewer` agent |
 | `fixer_model` | string | `"sonnet"` | Model of the fix agent |
+| `reviewer_effort` | string | `""` | Agent tool `effort` for the `reviewer`; `""` omits it |
+| `fixer_effort` | string | `""` | Agent tool `effort` for the fix agent; `""` omits it |
 | `review_checklist_file` | string | `""` | Project checklist replacing the built-in one |
 | `deep_auto_fix` | string | `"high"` | `none`, `critical`, `high`, `medium`, `all` |
 | `tier_thresholds` | object | `{"skip":500,"quick":5000,"standard":20000}` | Characters per tier (replaced as a whole) |
@@ -155,6 +158,21 @@ The built-in agent id is `reviewer` (`subagent_type` `general-purpose`). Its mod
 
 Use a cheaper `reviewer_model` (for example `sonnet`) for speed or cost; the `minimal` preset does this. Any non-empty string is accepted and passed to the Agent tool as `model`; the hook does not check that the model exists.
 
+### Effort
+
+`reviewer_effort` and `fixer_effort` set the Agent tool's `effort` argument, which is how hard the model reasons. Allowed values are `low`, `medium`, `high`, `xhigh` and `max`. The default, `""`, leaves `effort` out of the call, so the harness default for that model applies (for example a per-model `effortLevel` in Claude Code settings):
+
+```json
+{
+  "reviewer_model": "opus",
+  "reviewer_effort": "medium",
+  "fixer_model": "sonnet",
+  "fixer_effort": "high"
+}
+```
+
+This is separate from the tier text in [What a Tier Changes](#what-a-tier-changes). The tier tells the reviewer how much code to read; `effort` sets how hard the model reasons.
+
 The five agents of earlier versions (`explore_haiku`, `general_haiku`, `bug_hunter`, `integration_checker`, `general_opus`) no longer exist. Remove them from `agent_ids`; they are now an error.
 
 ## Review Checklist
@@ -202,7 +220,7 @@ The default is one reviewer. To run additional or different reviewers, define th
 
 Rules:
 
-- Each definition needs `subagent_type`, `model` and `checks` (non-empty). `context_checks` is optional.
+- Each definition needs `subagent_type`, `model` and `checks` (non-empty). `context_checks` and `effort` (see [Effort](#effort)) are optional.
 - `agent_ids` may only reference defined agents: `reviewer` or an id from `extra_agent_definitions`. Anything else is a config error.
 - `agent_ids` is merged per tier. Setting `deep` replaces the deep list and leaves `quick` and `standard` alone. Include `"reviewer"` if you still want it.
 - A custom agent is reviewed against its own `checks` text, not the checklist file. It only gets the context hints you define in its own `context_checks`; the built-in `reviewer` has all of them.

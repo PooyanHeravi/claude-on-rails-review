@@ -5,7 +5,9 @@
     "preset": "balanced",
 
     "reviewer_model": "opus",
+    "reviewer_effort": "medium",
     "fixer_model": "sonnet",
+    "fixer_effort": "high",
 
     "+critical_patterns": ["/api/", "/models/", "/migrations/"],
     "+excluded_paths": ["/docs/", "/examples/"],
@@ -14,6 +16,7 @@
         "security_checker": {
             "subagent_type": "general-purpose",
             "model": "sonnet",
+            "effort": "high",
             "checks": "authentication and authorization gaps, injection, secrets in code or logs",
             "context_checks": {
                 "api_routes": "Check auth middleware, input validation, rate limiting"
