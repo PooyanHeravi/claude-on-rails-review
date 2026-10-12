@@ -20,6 +20,7 @@ from stop_design_audit import config
 from stop_design_audit.agents import (
     AGENT_DEFINITIONS,
     TIER_EFFORT,
+    agent_call_args,
     load_checklist,
 )
 from stop_design_audit.classify import severities_at_or_above
@@ -190,7 +191,7 @@ def _spawn_instructions(state: ReviewState, agent_ids: list[str]) -> str:
             state.session_hash, state.round_id, agent_id
         )
         lines.append(
-            f"  - subagent_type='{defn['subagent_type']}', model='{defn['model']}', "
+            f"  - {agent_call_args(defn['subagent_type'], defn['model'], defn.get('effort', ''))}, "
             f"description='design audit {state.round_id} ({agent_id})', "
             f"prompt='Read {_posix(prompt_path)} and follow it exactly.'"
         )
@@ -329,7 +330,7 @@ def _handle_fail(state: ReviewState, results: dict[str, dict]) -> NoReturn:
 
     message = (
         f"{header}\nFix these {len(fixable)} issue(s) by spawning ONE Agent "
-        f"(subagent_type='general-purpose', model='{config.FIXER_MODEL}', "
+        f"({agent_call_args('general-purpose', config.FIXER_MODEL, config.FIXER_EFFORT)}, "
         f"run_in_background=false) and passing it this list:\n{_format_issues(fixable)}\n"
         f"{GIT_FIX_CONSTRAINT}\n"
     )

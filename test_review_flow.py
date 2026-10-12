@@ -239,6 +239,10 @@ CONFIG_CASES = [
     ("bad JSON", "{not json", "cannot parse"),
     ("unknown preset", json.dumps({"preset": "yolo"}), "unknown preset 'yolo'"),
     ("undefined agent", json.dumps({"agent_ids": {"quick": ["ghost"]}}), "references undefined agent 'ghost'"),
+    ("bad reviewer_effort", json.dumps({"reviewer_effort": "extreme"}), "'reviewer_effort' must be one of"),
+    ("bad custom agent effort", json.dumps({"extra_agent_definitions": {"sec": {
+        "subagent_type": "general-purpose", "model": "haiku", "checks": "x", "effort": "turbo"}}}),
+     "extra_agent_definitions.sec.effort must be one of"),
 ]
 
 
@@ -584,6 +588,57 @@ def test_project_checklist_replaces_default():
     return True
 
 
+def test_effort_reaches_agent_calls():
+    """reviewer_effort / fixer_effort / custom-agent effort become Agent `effort` args; unset means omitted."""
+    def reviewer_and_fixer_lines(overrides: dict) -> tuple[str, str] | None:
+        with overrides_file(json.dumps(overrides)):
+            with hook_session() as (transcript, session_hash):
+                write_edit_transcript(transcript)
+                output = expect_block(*run_hook(transcript))
+                if output is None:
+                    return None
+                spawn = output["reason"]
+                state = read_state_file(state_path_for(session_hash))
+                write_results(session_hash, state["round_id"], "fail", [issue("critical")])
+                output = expect_block(*run_hook(transcript))
+                if output is None:
+                    return None
+                return spawn, output["reason"]
+
+    got = reviewer_and_fixer_lines({})
+    if got is None:
+        return False
+    if "effort=" in got[0] or "effort=" in got[1]:
+        return fail(f"effort must be omitted when unset: {got[0][:300]} / {got[1][:300]}")
+
+    got = reviewer_and_fixer_lines({
+        "reviewer_model": "opus", "reviewer_effort": "medium",
+        "fixer_model": "sonnet", "fixer_effort": "high",
+    })
+    if got is None:
+        return False
+    if "model='opus', effort='medium'" not in got[0]:
+        return fail(f"reviewer spawn lacks effort='medium': {got[0][:400]}")
+    if "model='sonnet', effort='high'" not in got[1]:
+        return fail(f"fixer spawn lacks effort='high': {got[1][:400]}")
+
+    custom = {
+        "extra_agent_definitions": {"scan": {
+            "subagent_type": "general-purpose", "model": "haiku", "checks": "secrets", "effort": "xhigh"}},
+        "agent_ids": {"quick": ["reviewer", "scan"]},
+    }
+    with overrides_file(json.dumps(custom)):
+        with hook_session() as (transcript, _):
+            write_edit_transcript(transcript)
+            output = expect_block(*run_hook(transcript))
+            if output is None:
+                return False
+            if "model='haiku', effort='xhigh'" not in output["reason"]:
+                return fail(f"custom agent spawn lacks effort='xhigh': {output['reason'][:400]}")
+    print("  PASS: effort is passed to reviewer, fixer and custom agents; omitted when unset")
+    return True
+
+
 # =============================================================================
 # Runner
 # =============================================================================
@@ -856,6 +911,7 @@ LAYERS = [
         test_deep_default_splits_fix_and_report,
         test_pass_at_max_auto_continues_allows,
         test_project_checklist_replaces_default,
+        test_effort_reaches_agent_calls,
     ]),
     ("Design-audit review findings (round 656dfe68)", [
         test_review_not_disabled_after_loop_bound,

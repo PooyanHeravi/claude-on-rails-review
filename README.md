@@ -5,7 +5,7 @@
 A Claude Code `Stop` hook that reviews what Claude changed before it is allowed to stop. Review effort scales with the size of the change, only changes since the last review are examined, and every failure of the hook itself is reported loudly instead of being swallowed.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](CHANGELOG.md)
 
 ## Features
 

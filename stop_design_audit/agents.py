@@ -52,6 +52,7 @@ def _builtin_definitions() -> dict[str, dict]:
         "reviewer": {
             "subagent_type": "general-purpose",
             "model": config.REVIEWER_MODEL,
+            "effort": config.REVIEWER_EFFORT,
             "checks": "the review checklist",
             "context_checks": dict(CONTEXT_CHECKS),
         },
@@ -59,6 +60,12 @@ def _builtin_definitions() -> dict[str, dict]:
 
 
 AGENT_DEFINITIONS: dict[str, dict] = {}
+
+
+def agent_call_args(subagent_type: str, model: str, effort: str) -> str:
+    """Agent tool arguments for a spawn instruction; `effort` is omitted when empty."""
+    args = f"subagent_type='{subagent_type}', model='{model}'"
+    return f"{args}, effort='{effort}'" if effort else args
 
 
 def load_agent_definitions() -> None:
@@ -104,6 +111,13 @@ def load_agent_definitions() -> None:
         ):
             errors.append(
                 f"extra_agent_definitions.{agent_id}.context_checks must map strings to strings"
+            )
+            continue
+        effort = defn.get("effort", "")
+        if effort not in ("",) + config.EFFORT_LEVELS:
+            errors.append(
+                f"extra_agent_definitions.{agent_id}.effort must be one of "
+                f"{list(config.EFFORT_LEVELS)}, got {effort!r}"
             )
             continue
         AGENT_DEFINITIONS[agent_id] = defn
